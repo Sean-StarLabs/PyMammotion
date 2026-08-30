@@ -279,22 +279,30 @@ class MammotionClient:
         if handle is None:
             return None
 
-        async def _on_path_hashes_changed(path_hash: int) -> None:
+        async def _on_path_hashes_changed(hashes: tuple[int, int]) -> None:
             device = cast(MowerDevice, handle.snapshot.raw)
-            if device.map.current_mow_path and device.map.has_mow_path_for_hash(path_hash):
+            ub_path_hash, path_hash = hashes
+            effective_path_hash = (
+                path_hash if path_hash not in (0, 1) else ub_path_hash if ub_path_hash not in (0, 1) else 0
+            )
+            if effective_path_hash == 0:
+                return
+            if device.map.current_mow_path and device.map.has_mow_path_for_hash(effective_path_hash):
                 return  # Cache is valid for the current route
             if device.map.current_mow_path:
                 # Cache exists but for a different route — clear it before fetching.
                 device.map.invalidate_mow_path(0)
-            if not _should_fetch_mow_path(device, handle, path_hash):
+            if not _should_fetch_mow_path(device, handle, effective_path_hash):
                 return
             _logger.debug(
-                "Device %s path_hash=%d — auto-fetching cover path",
+                "Device %s path_hash=%d ub_path_hash=%d — auto-fetching cover path",
                 device_name,
                 path_hash,
+                ub_path_hash,
             )
             try:
                 current_work = GenerateRouteInformation.from_current_task_settings(device.work)
+                current_work.path_hash = effective_path_hash
                 await self.start_mow_path_saga(device_name, zone_hashs=[], route_info=current_work, skip_planning=True)
             except Exception:  # noqa: BLE001
                 _logger.warning("Auto-trigger MowPathSaga failed for %s", device_name, exc_info=True)
@@ -369,7 +377,10 @@ class MammotionClient:
                 _logger.warning("Auto-trigger plan sync failed for %s", device_name, exc_info=True)
 
         sub = handle.watch_field(
-            lambda s: s.raw.report_data.work.path_hash,  # type: ignore
+            lambda s: (  # type: ignore
+                s.raw.report_data.work.ub_path_hash,
+                s.raw.report_data.work.path_hash,
+            ),
             _on_path_hashes_changed,
         )
         progress_sub = handle.watch_field(
@@ -486,6 +497,38 @@ class MammotionClient:
             return
         if time.monotonic() - handle.last_report_at > max_age_s:
             await handle.request_report_snapshot()
+
+    async def ensure_fresh_report_data(
+        self,
+        device_name: str,
+        *,
+        max_age_s: float = 5.0,
+        timeout: float = 10.0,
+    ) -> bool:
+        """Wait until the device state contains recent report telemetry."""
+        handle = self._device_registry.get_by_name(device_name)
+        if handle is None:
+            return False
+        return await handle.ensure_fresh_report_data(max_age_s=max_age_s, timeout=timeout)
+
+    async def interrupt_sagas(self, device_name: str) -> bool:
+        """Interrupt map-transfer work before dispatching a user command."""
+        handle = self.mower(device_name)
+        if handle is None:
+            return False
+        return await handle.interrupt_sagas()
+
+    def report_data_token(self, device_name: str) -> float:
+        """Return the change token for the latest device telemetry report."""
+        handle = self._device_registry.get_by_name(device_name)
+        return handle.last_report_data_at if handle is not None else 0.0
+
+    async def wait_for_report_data(self, device_name: str, *, since: float, timeout: float) -> bool:
+        """Wait for device telemetry newer than *since*."""
+        handle = self._device_registry.get_by_name(device_name)
+        if handle is None:
+            return False
+        return await handle.wait_for_report_data(timeout, since=since)
 
     def subscribe_device_status(
         self,
@@ -2343,24 +2386,27 @@ class MammotionClient:
 
         """
         if handle := self._device_registry.get_by_name(device_name):
-            # MQTT-only gate: skip when mow_path_fetch_enabled is False AND BLE
-            # isn't actively connected (so this would go over MQTT).  BLE-routed
-            # fetches always run.
-            if not handle.mow_path_fetch_enabled and not handle.is_transport_connected(TransportType.BLE):
+            if not handle.mow_path_fetch_enabled:
                 _logger.debug(
-                    "start_mow_path_saga '%s': mow_path_fetch_enabled=False over MQTT — skipping",
+                    "start_mow_path_saga '%s': mow_path_fetch_enabled=False — skipping",
                     device_name,
                 )
                 return
+            prefer_ble = handle.is_transport_connected(TransportType.BLE)
+
+            async def _send_path_command(payload: bytes) -> None:
+                await handle.send_raw(payload, prefer_ble=prefer_ble)
+
             saga = MowPathSaga(
                 command_builder=handle.commands,
-                send_command=handle.send_raw,
+                send_command=_send_path_command,
                 get_map=lambda: handle.snapshot.raw.map,  # type: ignore
                 zone_hashs=zone_hashs,
                 route_info=route_info,
                 skip_planning=skip_planning,
                 device_name=device_name,
-                sync_type=2 if handle.is_transport_connected(TransportType.BLE) else 3,
+                sync_type=2 if prefer_ble else 3,
+                next_transaction_id=handle.next_route_transaction_id,
             )
 
             async def _on_mow_path_complete() -> None:
@@ -2741,6 +2787,7 @@ class MammotionClient:
         *,
         send_timeout: float = 5.0,
         prefer_ble: bool = True,
+        before_send: Callable[[], None] | None = None,
         **kwargs: Any,
     ) -> Any:
         """Send a command and wait for the matching protobuf response.
@@ -2772,7 +2819,11 @@ class MammotionClient:
 
         async def _send() -> None:
             await self._send_with_auth_retry(
-                lambda: handle.send_raw(payload=command_bytes, prefer_ble=prefer_ble),
+                lambda: handle.send_raw(
+                    payload=command_bytes,
+                    prefer_ble=prefer_ble,
+                    before_send=before_send,
+                ),
                 _session,
             )
 
@@ -2789,11 +2840,7 @@ class MammotionClient:
             handle.set_prefer_ble(value=prefer_ble)
 
     def set_mow_path_fetch_enabled(self, device_id: str, *, enabled: bool) -> None:
-        """Toggle the MQTT-side mow path fetch gate for a registered device.
-
-        When False, MowPathSaga is skipped for any send that would go over
-        MQTT.  BLE-routed fetches always run regardless.
-        """
+        """Enable or disable native mow-path fetching for a registered device."""
         handle = self._device_registry.get(device_id)
         if handle is not None:
             handle.set_mow_path_fetch_enabled(value=enabled)

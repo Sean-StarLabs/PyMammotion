@@ -1,4 +1,5 @@
 """Tests for DeviceHandle and DeviceRegistry."""
+
 from __future__ import annotations
 
 import asyncio
@@ -335,9 +336,7 @@ async def test_ble_message_does_not_clear_reported_offline() -> None:
     await handle.add_transport(ble)
     handle.update_availability(TransportType.CLOUD_ALIYUN, TransportAvailability.CONNECTED)
 
-    handle.update_availability(
-        TransportType.CLOUD_ALIYUN, TransportAvailability.CONNECTED, mqtt_reported_offline=True
-    )
+    handle.update_availability(TransportType.CLOUD_ALIYUN, TransportAvailability.CONNECTED, mqtt_reported_offline=True)
     assert handle.availability.mqtt_reported_offline is True
 
     _patch_raw_message_internals(handle)
@@ -375,7 +374,12 @@ async def test_ble_fallback_used_when_mqtt_offline(transport_type: TransportType
 
     call_count = 0
 
-    async def _send_marked_side_effect(transport: object, payload: bytes) -> None:  # noqa: ARG001
+    async def _send_marked_side_effect(
+        transport: object,
+        payload: bytes,
+        *,
+        before_send: object = None,
+    ) -> None:  # noqa: ARG001
         nonlocal call_count
         call_count += 1
         if call_count == 1:
@@ -439,7 +443,9 @@ async def test_on_raw_message_drops_frame_with_malformed_report_data(caplog: pyt
     )
 
     # First a clean frame so we have a known-good baseline state.
-    await handle.on_raw_message(bytes(LubaMsg(sys=MctlSys(toapp_report_data=ReportInfoData(dev=RptDevStatus(battery_val=55))))))
+    await handle.on_raw_message(
+        bytes(LubaMsg(sys=MctlSys(toapp_report_data=ReportInfoData(dev=RptDevStatus(battery_val=55)))))
+    )
     assert handle.snapshot.raw.report_data.dev.battery_val == 55
 
     emitted: list[object] = []
@@ -744,6 +750,7 @@ def _make_concrete_transport() -> Transport:
         @property
         def availability(self):  # type: ignore[override]
             from pymammotion.transport.base import TransportAvailability
+
             return TransportAvailability.CONNECTED
 
         async def connect(self) -> None:
@@ -932,7 +939,7 @@ async def test_ble_transport_not_blocked_by_rate_limited_flag() -> None:
     ble.last_received_monotonic = 0.0
     handle._transports[TransportType.BLE] = ble  # noqa: SLF001
 
-    await handle._send_marked(ble, b"\xAA\xBB")  # noqa: SLF001
+    await handle._send_marked(ble, b"\xaa\xbb")  # noqa: SLF001
 
     ble.send.assert_awaited_once()
 
@@ -985,7 +992,7 @@ def rpt_handle(monkeypatch: pytest.MonkeyPatch) -> DeviceHandle:
     h._last_report_data_at = 0.0
     h._report_data_event = asyncio.Event()
     mocked_commands = MagicMock()
-    mocked_commands.send_todev_ble_sync = MagicMock(return_value=b"\xAAsync")
+    mocked_commands.send_todev_ble_sync = MagicMock(return_value=b"\xaasync")
     monkeypatch.setattr(DeviceHandle, "commands", property(lambda self: mocked_commands))
     return h
 
@@ -996,6 +1003,40 @@ def _feed_report(handle: DeviceHandle) -> None:
     handle._report_data_event.set()
 
 
+async def test_ensure_fresh_report_data_accepts_recent_report(
+    rpt_handle: DeviceHandle,
+) -> None:
+    """Recent report telemetry does not cause another device poll."""
+    rpt_handle._last_report_data_at = asyncio.get_running_loop().time()
+    rpt_handle.request_reports = AsyncMock()
+
+    assert await rpt_handle.ensure_fresh_report_data(max_age_s=5.0, timeout=0.1)
+    rpt_handle.request_reports.assert_not_awaited()
+
+
+async def test_ensure_fresh_report_data_waits_for_new_report(
+    rpt_handle: DeviceHandle,
+) -> None:
+    """Stale state is accepted only after a newer report frame arrives."""
+
+    async def request_reports(*, count: int) -> None:
+        assert count == 1
+        asyncio.get_running_loop().call_soon(_feed_report, rpt_handle)
+
+    rpt_handle.request_reports = request_reports
+
+    assert await rpt_handle.ensure_fresh_report_data(max_age_s=0.0, timeout=0.1)
+
+
+async def test_ensure_fresh_report_data_times_out_without_report(
+    rpt_handle: DeviceHandle,
+) -> None:
+    """A queued request without telemetry is not reported as fresh state."""
+    rpt_handle.request_reports = AsyncMock()
+
+    assert not await rpt_handle.ensure_fresh_report_data(max_age_s=0.0, timeout=0.01)
+
+
 @pytest.fixture(autouse=True)
 def _fast_ack_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     """Shrink the 5 s ack window so timeout paths don't stall the suite."""
@@ -1004,7 +1045,7 @@ def _fast_ack_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
 
 async def test_success_returns_true_and_sends_once(rpt_handle: DeviceHandle) -> None:
     """A report frame during attempt 1 → True, one send, no sync."""
-    cmd_bytes = b"\xBBcmd"
+    cmd_bytes = b"\xbbcmd"
     sync_fn = AsyncMock()
 
     async def transport_send(_payload: bytes) -> None:
@@ -1021,7 +1062,7 @@ async def test_success_returns_true_and_sends_once(rpt_handle: DeviceHandle) -> 
 
 async def test_retry_syncs_before_resending(rpt_handle: DeviceHandle) -> None:
     """Attempt 1 draws nothing → re-sync, then re-send; report on attempt 2 → True."""
-    cmd_bytes = b"\xBBcmd"
+    cmd_bytes = b"\xbbcmd"
     calls: list[str] = []
 
     async def sync_fn() -> None:
@@ -1040,7 +1081,7 @@ async def test_retry_syncs_before_resending(rpt_handle: DeviceHandle) -> None:
 
 async def test_no_report_after_both_attempts_returns_false(rpt_handle: DeviceHandle) -> None:
     """Neither attempt draws a report frame → False, no raise, two sends."""
-    cmd_bytes = b"\xBBcmd"
+    cmd_bytes = b"\xbbcmd"
     transport_send = AsyncMock()
 
     result = await rpt_handle._send_rpt_start_verified(cmd_bytes, transport_send, AsyncMock())
@@ -1051,7 +1092,7 @@ async def test_no_report_after_both_attempts_returns_false(rpt_handle: DeviceHan
 
 async def test_sync_failure_does_not_abort_retry(rpt_handle: DeviceHandle) -> None:
     """A flaky re-sync must not block the retry send itself."""
-    cmd_bytes = b"\xBBcmd"
+    cmd_bytes = b"\xbbcmd"
     sync_fn = AsyncMock(side_effect=RuntimeError("flaky sync write"))
 
     async def transport_send(_payload: bytes) -> None:
@@ -1076,7 +1117,7 @@ async def test_defaults_to_quota_free_force_sync(rpt_handle: DeviceHandle, monke
     monkeypatch.setattr(DeviceHandle, "_force_sync", forced)
     transport_send = AsyncMock()
 
-    result = await rpt_handle._send_rpt_start_verified(b"\xBBcmd", transport_send)
+    result = await rpt_handle._send_rpt_start_verified(b"\xbbcmd", transport_send)
 
     assert result is False
     forced.assert_awaited_once()
@@ -1089,7 +1130,7 @@ async def test_frame_already_in_flight_counts(rpt_handle: DeviceHandle) -> None:
     request was registered did not resolve it, so a healthily-streaming device still ate
     a redundant retry.
     """
-    cmd_bytes = b"\xBBcmd"
+    cmd_bytes = b"\xbbcmd"
 
     async def transport_send(_payload: bytes) -> None:
         asyncio.get_running_loop().call_soon(_feed_report, rpt_handle)
@@ -1164,8 +1205,7 @@ def test_identical_selections_emit_one_log_line(dedup_handle: DeviceHandle, capl
         r for r in caplog.records if "selected" in r.getMessage() and "active_transport" in r.getMessage()
     ]
     assert len(selection_lines) == 1, (
-        f"Expected 1 selection log line, got {len(selection_lines)}.  "
-        f"The de-dupe in active_transport regressed."
+        f"Expected 1 selection log line, got {len(selection_lines)}.  The de-dupe in active_transport regressed."
     )
 
 
@@ -1187,19 +1227,15 @@ def test_state_transition_re_emits_log(dedup_handle: DeviceHandle, caplog: pytes
 
     # Snapshot rule-match logs from these three calls (no error path yet).
     rule_lines = [
-        r for r in caplog.records
+        r
+        for r in caplog.records
         if r.name == "pymammotion.device.handle"
-        and (
-            "BLE preferred" in r.getMessage()
-            or "selected " in r.getMessage()
-            or "MQTT unusable" in r.getMessage()
-        )
+        and ("BLE preferred" in r.getMessage() or "selected " in r.getMessage() or "MQTT unusable" in r.getMessage())
     ]
     # Expect exactly 2 transitions logged: (1) BLE-unusable-fallback,
     # (2) BLE-usable.  The repeat in between is suppressed.
     assert len(rule_lines) == 2, (
-        f"Expected 2 transition logs, got {len(rule_lines)}.  "
-        f"Messages: {[r.getMessage() for r in rule_lines]}"
+        f"Expected 2 transition logs, got {len(rule_lines)}.  Messages: {[r.getMessage() for r in rule_lines]}"
     )
 
     # Sanity: when both transports go unusable, active_transport raises
@@ -1223,8 +1259,7 @@ def test_prefer_ble_change_is_a_transition(dedup_handle: DeviceHandle, caplog: p
     dedup_handle.active_transport(prefer_ble=True)  # back to BLE preferred + fallback
 
     rule_lines = [
-        r for r in caplog.records
-        if "BLE preferred but not usable" in r.getMessage() or "selected " in r.getMessage()
+        r for r in caplog.records if "BLE preferred but not usable" in r.getMessage() or "selected " in r.getMessage()
     ]
     # 3 distinct (selection-path, prefer_ble) combinations → at least 3 logs
     assert len(rule_lines) >= 3
@@ -1359,9 +1394,39 @@ async def test_wifi_only_send_uses_mqtt() -> None:
     mqtt = _make_transport(TransportType.CLOUD_ALIYUN, connected=True)
     await handle.add_transport(mqtt)
 
-    await handle.send_raw(b"\xAB\xCD")
+    await handle.send_raw(b"\xab\xcd")
 
-    mqtt.send.assert_awaited_once_with(b"\xAB\xCD", iot_id="", firmware_version=ANY)
+    mqtt.send.assert_awaited_once_with(b"\xab\xcd", iot_id="", firmware_version=ANY)
+
+
+async def test_send_raw_checks_cancellation_at_transport_boundary() -> None:
+    """The final guard runs after transport selection and before transport.send."""
+    handle = _make_handle()
+    mqtt = _make_transport(TransportType.CLOUD_ALIYUN, connected=True)
+    await handle.add_transport(mqtt)
+
+    class _Preempted(Exception):
+        pass
+
+    def before_send() -> None:
+        raise _Preempted
+
+    with pytest.raises(_Preempted):
+        await handle.send_raw(b"\xab\xcd", before_send=before_send)
+
+    mqtt.send_heartbeat.assert_awaited_once()
+    mqtt.send.assert_not_awaited()
+
+
+def test_route_transaction_ids_are_unique_when_time_is_frozen() -> None:
+    """Successive sagas on one device cannot reuse a millisecond transaction ID."""
+    handle = _make_handle()
+
+    with patch("pymammotion.device.handle.time.time", return_value=1234.5):
+        first = handle.next_route_transaction_id()
+        second = handle.next_route_transaction_id()
+
+    assert second == first + 1
 
 
 # ---------------------------------------------------------------------------
@@ -1418,10 +1483,10 @@ async def test_hybrid_ble_disconnected_reconnects_in_background_when_no_mqtt() -
     ble.connect.side_effect = _do_connect
     await handle.add_transport(ble)
 
-    await handle.send_raw(b"\xDE\xAD", prefer_ble=True)
+    await handle.send_raw(b"\xde\xad", prefer_ble=True)
     await asyncio.sleep(0)  # let the background connect task run
 
-    ble.send.assert_awaited_once_with(b"\xDE\xAD", iot_id="", firmware_version=ANY)
+    ble.send.assert_awaited_once_with(b"\xde\xad", iot_id="", firmware_version=ANY)
     ble.connect.assert_awaited_once()  # reconnect attempted in the background
 
 
@@ -1598,7 +1663,7 @@ def transport():
 
 def _make_event_envelope(envelope_time_ms: int, identifier: str = "device_protobuf_msg_event") -> bytes:
     """Build a raw JSON thing/events envelope with the given params.time."""
-    sample_bytes = b'\x08\xf4\x01\x10\x01\x18\x07(\x010\x01R\x08\xba\x02\x05\x12\x03\x08\x05\x10K'
+    sample_bytes = b"\x08\xf4\x01\x10\x01\x18\x07(\x010\x01R\x08\xba\x02\x05\x12\x03\x08\x05\x10K"
     encoded = base64.b64encode(sample_bytes).decode("ascii")
 
     payload = {
@@ -1812,7 +1877,12 @@ async def test_device_unbound_retries_over_ble() -> None:
 
     call_count = 0
 
-    async def _side_effect(transport: object, payload: bytes) -> None:  # noqa: ARG001
+    async def _side_effect(
+        transport: object,
+        payload: bytes,
+        *,
+        before_send: object = None,
+    ) -> None:  # noqa: ARG001
         nonlocal call_count
         call_count += 1
         if call_count == 1:

@@ -97,6 +97,36 @@ async def test_watcher_no_trigger_when_path_hash_is_one() -> None:
     client.start_mow_path_saga.assert_not_awaited()
 
 
+async def test_watcher_ignores_yuka_sentinel_hashes() -> None:
+    """Yuka's initial 0/1 hashes do not identify native route geometry."""
+    client, handle, handlers = _make_client_with_handle("Yuka-MLYQ73XB")
+    _set_snapshot(handle, ub_path_hash=1, path_hash=0)
+    device = handle.snapshot.raw
+    device.report_data.dev.sys_status = 13
+    device.report_data.locations = [MagicMock(bol_hash=42)]
+    device.map.computed_bol_hash = 42
+
+    await handlers[0]((1, 0))
+
+    client.start_mow_path_saga.assert_not_awaited()
+
+
+async def test_watcher_uses_live_yuka_route_hash() -> None:
+    """Yuka's live route hash is forwarded to the native cover-path request."""
+    client, handle, handlers = _make_client_with_handle("Yuka-MLYQ73XB")
+    _set_snapshot(handle, ub_path_hash=42, path_hash=0)
+    device = handle.snapshot.raw
+    device.report_data.dev.sys_status = 13
+    device.report_data.locations = [MagicMock(bol_hash=7)]
+    device.map.computed_bol_hash = 7
+
+    await handlers[0]((42, 0))
+
+    client.start_mow_path_saga.assert_awaited_once()
+    route_info = client.start_mow_path_saga.await_args.kwargs["route_info"]
+    assert route_info.path_hash == 42
+
+
 # ---------------------------------------------------------------------------
 # Test: cover path already loaded → no saga
 # ---------------------------------------------------------------------------

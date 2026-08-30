@@ -370,6 +370,10 @@ class MowerDevice(Device):
             # wipe live mow data (cover path, zone list, GeoJSON) mid-job.
             sys_status = toapp_report_data.dev.sys_status if toapp_report_data.dev else 0
             is_actively_mowing = sys_status in MOWING_ACTIVE_MODES
+            previous_status = self.report_data.dev.sys_status
+            was_actively_mowing = previous_status in MOWING_ACTIVE_MODES
+            if is_actively_mowing and not was_actively_mowing:
+                self.map.invalidate_mow_path(0)
             if not is_actively_mowing:
                 if (toapp_report_data.work.area >> 16) == 0 and toapp_report_data.work.ub_path_hash == 0:
                     self.work.zone_hashs = []

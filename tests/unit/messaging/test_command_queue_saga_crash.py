@@ -2,8 +2,8 @@
 
 If `saga.execute(broker)` raises an unhandled exception the ``_exclusive_active``
 must still be set again so subsequent commands can run on the same device queue.
-Cancellation is tested via ``stop()`` + ``start()`` — there is no separate work-item
-sub-task in the current design (work runs directly in the processor task).
+Cancellation is tested through both queue shutdown and explicit user-command
+interruption.
 """
 
 from __future__ import annotations
@@ -133,5 +133,50 @@ async def test_on_saga_start_cancellation_releases_exclusive_lock() -> None:
         await asyncio.sleep(0.2)
 
         assert q.is_saga_active is False, "exclusive lock not released after on_saga_start cancel"
+    finally:
+        await q.stop()
+
+
+async def test_interrupt_sagas_cancels_active_saga_without_stopping_queue() -> None:
+    """A user command can interrupt a saga and then use the same queue."""
+    q = DeviceCommandQueue(device_name="dev-interrupt")
+    broker = DeviceMessageBroker()
+    saga = _SlowSaga()
+    q.start()
+    try:
+        await q.enqueue_saga(saga, broker)
+        await asyncio.wait_for(saga.started.wait(), timeout=2.0)
+
+        assert await q.interrupt_sagas() is True
+        assert q.is_saga_active is False
+
+        ran = asyncio.Event()
+
+        async def follow_up() -> None:
+            ran.set()
+
+        await q.enqueue(follow_up, priority=Priority.NORMAL)
+        await asyncio.wait_for(ran.wait(), timeout=2.0)
+    finally:
+        await q.stop()
+
+
+async def test_interrupt_sagas_discards_older_queued_sagas() -> None:
+    """Sagas queued before a user command do not start after interruption."""
+    q = DeviceCommandQueue(device_name="dev-discard")
+    broker = DeviceMessageBroker()
+    active = _SlowSaga()
+    stale = _SlowSaga()
+    q.start()
+    try:
+        await q.enqueue_saga(active, broker)
+        await q.enqueue_saga(stale, broker)
+        await asyncio.wait_for(active.started.wait(), timeout=2.0)
+
+        await q.interrupt_sagas()
+        await asyncio.sleep(0.1)
+
+        assert not stale.started.is_set()
+        assert q.is_saga_active is False
     finally:
         await q.stop()

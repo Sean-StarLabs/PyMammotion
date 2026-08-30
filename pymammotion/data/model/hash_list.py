@@ -901,8 +901,9 @@ class HashList(DataClassORJSONMixin):
 
     def update_mow_path(self, path: MowPath) -> None:
         """Store *path* at ``current_mow_path[transaction_id][current_frame]``."""
-        # TODO check if we need to clear the current_mow_path first
         transaction_id = path.transaction_id
+        if path.result != 0 or path.total_frame <= 0:
+            return
         if transaction_id not in self.current_mow_path:
             self.current_mow_path[transaction_id] = {}
         self.current_mow_path[transaction_id][path.current_frame] = path
@@ -1054,10 +1055,12 @@ class HashList(DataClassORJSONMixin):
         be preserved — the device advances ub_path_hash through segments during
         a mow and wiping on every change would discard live data.
         """
-        if path_hash == 0:
+        if path_hash in (0, 1):
             self.current_mow_path = {}
             self.generated_mow_path_geojson = {}
             self.generated_mow_progress_geojson = {}
+            self.dynamics_line = []
+            self.generated_dynamics_line_geojson = {}
             self.last_ub_path_hash = 0
 
     def has_mow_path_for_hash(self, path_hash: int) -> bool:
@@ -1066,11 +1069,26 @@ class HashList(DataClassORJSONMixin):
         Matches against ``path_packets[0].path_hash`` in any transaction's first
         frame — equals ``work.path_hash`` (field 2) when the cached data is current.
         """
-        for frames in self.current_mow_path.values():
+        for transaction_id, frames in self.current_mow_path.items():
+            if not self.is_mow_path_transaction_complete(transaction_id):
+                continue
             for mow_path in frames.values():
                 if mow_path.path_packets and mow_path.path_packets[0].path_hash == path_hash:
                     return True
         return False
+
+    def is_mow_path_transaction_complete(self, transaction_id: int) -> bool:
+        """Return whether a cover-path transaction has every declared frame."""
+        frames = self.current_mow_path.get(transaction_id, {})
+        if not frames:
+            return False
+        total_frame = max((frame.total_frame for frame in frames.values()), default=0)
+        return total_frame > 0 and all(frame_number in frames for frame_number in range(1, total_frame + 1))
+
+    def discard_incomplete_mow_path_transaction(self, transaction_id: int) -> None:
+        """Remove partial route data left by an interrupted transfer."""
+        if not self.is_mow_path_transaction_complete(transaction_id):
+            self.current_mow_path.pop(transaction_id, None)
 
     def invalidate_breakpoint_line(self, ub_path_hash: int) -> bool:
         """Sync ``self.line`` to the device's active breakpoint hash; return True if a fetch is needed.

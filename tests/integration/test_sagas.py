@@ -697,9 +697,7 @@ async def test_map_saga_resumes_partial_area_via_synchronize_hash_data() -> None
         if cmd == b"hash_list_cmd" and active_callbacks:
             # Deliver the single-frame root hash list (same hashes as seeded).
             await active_callbacks[-1](
-                _make_hash_list_ack_response(
-                    total_frame=1, current_frame=1, sub_cmd=0, data_couple=[111, 222, 333]
-                )
+                _make_hash_list_ack_response(total_frame=1, current_frame=1, sub_cmd=0, data_couple=[111, 222, 333])
             )
         # After saga sends synchronize_hash_data for the partial hash,
         # simulate the device delivering the missing frame.
@@ -850,14 +848,13 @@ async def test_mow_path_saga_syncs_before_route_and_line_info() -> None:
     broker.subscribe_unsolicited.side_effect = subscribe_side_effect
 
     # Route response returned by the (mocked) send_and_wait for step 2.
-    route_val = MagicMock(sub_cmd=0, path_hash=0)
+    route_val = MagicMock(sub_cmd=0, path_hash=100)
     route_response = MagicMock()
     route_response.nav.bidire_reqconver_path = route_val
     broker.send_and_wait.return_value = route_response
 
     # Step-1 hash frame (sub_cmd=3, single frame) fed when the line-hash-list request is sent.
-    hash_frame = MagicMock()
-    hash_frame.nav.toapp_gethash_ack = MagicMock(sub_cmd=3, current_frame=1, total_frame=1)
+    hash_frame = _make_hash_list_ack_response(sub_cmd=3, data_couple=[100])
 
     cb = MagicMock()
     cb.send_todev_ble_sync.return_value = b"ble_sync"
@@ -867,7 +864,7 @@ async def test_mow_path_saga_syncs_before_route_and_line_info() -> None:
     cb.get_line_info_list.side_effect = _StopAfterLineInfo  # halt once the cover-path request fires
 
     async def send_command(cmd: bytes) -> None:
-        if cmd == b"hash_list_cmd" and active_callbacks:
+        if active_callbacks:
             await active_callbacks[-1](hash_frame)
 
     def _which(obj: Any, group: str) -> tuple[str, Any]:
@@ -911,6 +908,94 @@ async def test_mow_path_saga_syncs_before_route_and_line_info() -> None:
     assert names[line_idx - 1] == "send_todev_ble_sync", f"no sync before cover-path: {names[: line_idx + 1]}"
 
     cb.send_todev_ble_sync.assert_called_with(sync_type=2)
+
+
+async def test_mow_path_saga_uses_accepted_route_hash_without_fresh_manifest() -> None:
+    """A missing line manifest must not reuse cached hashes from another job."""
+
+    class _StopAfterLineInfo(Exception):
+        pass
+
+    hash_list = HashList()
+    hash_list.root_hash_lists = [
+        RootHashList(
+            total_frame=1,
+            sub_cmd=3,
+            data=[
+                NavGetHashListData(
+                    sub_cmd=3,
+                    total_frame=1,
+                    current_frame=1,
+                    data_couple=[111, 222],
+                )
+            ],
+        )
+    ]
+    broker = AsyncMock(spec=DeviceMessageBroker)
+    subscribe_side_effect, _active_callbacks = _make_subscribe_ctx()
+    broker.subscribe_unsolicited.side_effect = subscribe_side_effect
+
+    route_val = MagicMock(sub_cmd=0, path_hash=999)
+    route_response = MagicMock()
+    route_response.nav.bidire_reqconver_path = route_val
+    broker.send_and_wait.return_value = route_response
+
+    builder = _make_command_builder()
+    builder.send_todev_ble_sync.return_value = b"ble_sync"
+    builder.generate_route_information.return_value = b"route_cmd"
+    builder.get_line_info_list.side_effect = _StopAfterLineInfo
+
+    def _which(obj: Any, group: str) -> tuple[str, Any]:
+        if group == "LubaSubMsg":
+            return ("nav", obj.nav)
+        bidire = getattr(obj, "bidire_reqconver_path", None)
+        if isinstance(getattr(bidire, "sub_cmd", None), int):
+            return ("bidire_reqconver_path", bidire)
+        return ("toapp_gethash_ack", obj.toapp_gethash_ack)
+
+    with patch("betterproto2.which_one_of", side_effect=_which):
+        saga = MowPathSaga(
+            command_builder=builder,
+            send_command=AsyncMock(),
+            get_map=lambda: hash_list,
+            zone_hashs=[100],
+        )
+        saga.step_timeout = 0.01
+        with pytest.raises(_StopAfterLineInfo):
+            await saga.execute(broker)
+
+    builder.get_line_info_list.assert_called_once()
+    assert builder.get_line_info_list.call_args.args[0] == [999]
+
+
+def test_mow_path_saga_ignores_failed_frame_from_completed_batch() -> None:
+    """A delayed failure from batch one must not abort batch two."""
+    hash_list = HashList()
+    hash_list.current_mow_path[100] = {1: MowPath(total_frame=1, current_frame=1, transaction_id=100)}
+    saga = MowPathSaga(
+        command_builder=_make_command_builder(),
+        send_command=AsyncMock(),
+        get_map=lambda: hash_list,
+        zone_hashs=[],
+    )
+    stale_failure = MowPath(result=1, total_frame=0, current_frame=1, transaction_id=100)
+
+    assert saga._accept_batch_frame(stale_failure, transaction_id=200) is False
+    assert saga._get_map().is_mow_path_transaction_complete(100)  # noqa: SLF001
+
+
+def test_mow_path_saga_rejects_failed_frame_for_current_batch() -> None:
+    """A terminal response for the requested batch still fails the saga."""
+    saga = MowPathSaga(
+        command_builder=_make_command_builder(),
+        send_command=AsyncMock(),
+        get_map=HashList,
+        zone_hashs=[],
+    )
+    failure = MowPath(result=1, total_frame=0, current_frame=1, transaction_id=200)
+
+    with pytest.raises(SagaFailedError):
+        saga._accept_batch_frame(failure, transaction_id=200)
 
 
 # ---------------------------------------------------------------------------
@@ -984,9 +1069,7 @@ async def test_spino_plan_saga_empty_device_short_circuits() -> None:
     subscribe_side_effect, active_callbacks = _make_subscribe_ctx()
     broker.subscribe_unsolicited.side_effect = subscribe_side_effect
 
-    empty_response = MagicMock(
-        ctrl=MagicMock(plan_job_set=MagicMock(totalplannum=0, jobid=0))
-    )
+    empty_response = MagicMock(ctrl=MagicMock(plan_job_set=MagicMock(totalplannum=0, jobid=0)))
 
     async def send_command(_cmd: bytes) -> None:
         if active_callbacks:

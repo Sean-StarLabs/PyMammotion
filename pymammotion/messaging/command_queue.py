@@ -82,6 +82,8 @@ class DeviceCommandQueue:
         self._task: asyncio.Task[None] | None = None
         self._device_name = device_name
         self._pending_dedup_keys: set[str] = set()
+        self._saga_generation = 0
+        self._active_saga_task: asyncio.Task[None] | None = None
         #: Called on critical errors (AuthError, SagaFailedError) so DeviceHandle can propagate them.
         self.on_critical_error: Callable[[Exception], Awaitable[None]] | None = None
         #: Fired when an exclusive saga is about to start.  Clients use this to pause the
@@ -175,8 +177,11 @@ class DeviceCommandQueue:
         on_complete: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         """Enqueue a saga as an exclusive blocking operation."""
+        generation = self._saga_generation
 
         async def _run() -> None:
+            if generation != self._saga_generation:
+                return
             self._exclusive_active.clear()
             saga_exception: BaseException | None = None
             try:
@@ -187,8 +192,17 @@ class DeviceCommandQueue:
                         _logger.exception("on_saga_start callback failed for saga '%s'", saga.name)
                 saga.device_name = self._device_name
                 try:
-                    await saga.execute(broker)
+                    saga_task = asyncio.create_task(saga.execute(broker))
+                    self._active_saga_task = saga_task
+                    await saga_task
                 except asyncio.CancelledError:
+                    if asyncio.current_task() is not None and not asyncio.current_task().cancelling():
+                        _logger.debug(
+                            "DeviceCommandQueue[%s]: interrupted saga '%s' for a user command",
+                            self._device_name,
+                            saga.name,
+                        )
+                        return
                     saga_exception = asyncio.CancelledError()
                     raise
                 except Exception as exc:
@@ -197,7 +211,13 @@ class DeviceCommandQueue:
                     # expected operational errors handled by the _process retry
                     # loop — logging them here as "unhandled" is misleading noise.
                     if not isinstance(
-                        exc, (GatewayTimeoutException, DeviceOfflineException, NoTransportAvailableError)
+                        exc,
+                        (
+                            GatewayTimeoutException,
+                            DeviceOfflineException,
+                            NoTransportAvailableError,
+                            SagaFailedError,
+                        ),
                     ):
                         _logger.exception("Saga '%s' raised an unhandled exception", saga.name)
                     raise
@@ -205,6 +225,7 @@ class DeviceCommandQueue:
                 # Always release the exclusive lock and clear the work-task pointer,
                 # even on cancellation or unhandled exception — otherwise the queue deadlocks.
                 self._exclusive_active.set()
+                self._active_saga_task = None
                 if self.on_saga_end is not None:
                     try:
                         await self.on_saga_end()
@@ -217,6 +238,18 @@ class DeviceCommandQueue:
                     _logger.exception("on_complete callback failed for saga '%s'", saga.name)
 
         await self.enqueue(_run, priority=Priority.EXCLUSIVE)
+
+    async def interrupt_sagas(self) -> bool:
+        """Discard queued sagas and interrupt the active saga for a user command."""
+        self._saga_generation += 1
+        task = self._active_saga_task
+        if task is None or task.done():
+            return False
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        await self._exclusive_active.wait()
+        return True
 
     async def _process(self) -> None:
         """Queue processor loop — runs as an asyncio background task."""

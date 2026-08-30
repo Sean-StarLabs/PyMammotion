@@ -132,6 +132,11 @@ def test_is_mini_or_x_series_returns_false(device_name: str) -> None:
     )
 
 
+def test_yuka_ml_does_not_claim_unverified_dynamics_line_support() -> None:
+    """YUKA_ML must not start a type-18 poll loop without protocol evidence."""
+    assert not DeviceType.YUKA_ML.is_support_dynamics_line("2.3.30.26")
+
+
 # ===========================================================================
 # from_value / value_of_str — data-driven lookup tables match the original if-chains
 # ===========================================================================

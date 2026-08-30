@@ -257,7 +257,6 @@ class DeviceType(Enum):
         if self in (
             DeviceType.YUKA_MINIV,
             DeviceType.YUKA_MN100,
-            DeviceType.YUKA_ML,
             DeviceType.LUBA_HM,
             DeviceType.LUBA_ME,
             DeviceType.LUBA_LA,

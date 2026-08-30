@@ -173,6 +173,33 @@ async def test_mower_returns_handle() -> None:
     assert client.mower("no-such-device") is None
 
 
+async def test_report_data_token_returns_handle_token() -> None:
+    """The client exposes the handle's telemetry generation token."""
+    client = MammotionClient()
+    handle = make_handle("dev1", "Yuka-Prime")
+    handle._last_report_data_at = 42.5
+    await client._device_registry.register(handle)
+
+    assert client.report_data_token("Yuka-Prime") == 42.5
+    assert client.report_data_token("no-such-device") == 0.0
+
+
+async def test_wait_for_report_data_delegates_to_handle() -> None:
+    """The client waits on the named handle without exposing registry internals."""
+    client = MammotionClient()
+    handle = make_handle("dev1", "Yuka-Prime")
+    handle.wait_for_report_data = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    await client._device_registry.register(handle)
+
+    assert await client.wait_for_report_data(
+        "Yuka-Prime", since=12.0, timeout=3.0
+    )
+    handle.wait_for_report_data.assert_awaited_once_with(3.0, since=12.0)
+    assert not await client.wait_for_report_data(
+        "no-such-device", since=0.0, timeout=1.0
+    )
+
+
 # ---------------------------------------------------------------------------
 # test 8: get_device_by_name returns MowingDevice (snapshot.raw)
 # ---------------------------------------------------------------------------
@@ -309,6 +336,22 @@ async def test_start_mow_path_saga_generates_geojson_on_completion() -> None:
         await asyncio.sleep(0.15)
 
     mock_device.map.generate_mowing_geojson.assert_called_once()
+    await handle.stop()
+
+
+async def test_start_mow_path_saga_respects_disabled_option_over_ble() -> None:
+    """A disabled path fetch must not run merely because BLE is connected."""
+    client = MammotionClient()
+    handle = await _make_handle_with_transport("dev1", "Luba-Mow")
+    handle.is_transport_connected = MagicMock(return_value=True)  # type: ignore[method-assign]
+    handle.set_mow_path_fetch_enabled(value=False)
+    await client._device_registry.register(handle)
+
+    with patch("pymammotion.client.MowPathSaga") as mock_saga:
+        await client.start_mow_path_saga("Luba-Mow", zone_hashs=[1, 2])
+        await asyncio.sleep(0.05)
+
+    mock_saga.assert_not_called()
     await handle.stop()
 
 

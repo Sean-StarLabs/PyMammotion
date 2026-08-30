@@ -5,6 +5,8 @@ import json
 
 from pymammotion.data.model.device import MowingDevice
 from pymammotion.data.model.hash_list import FrameList, HashList, MowPath, NavGetCommData
+from pymammotion.proto import ReportInfoData, RptDevStatus, RptWork
+from pymammotion.utility.constant import WorkMode
 
 
 def _make_hash_list_with_int_keys() -> HashList:
@@ -49,6 +51,54 @@ def test_empty_mowing_device_roundtrip() -> None:
     assert json_str
     data = json.loads(json_str)
     assert data["name"] == "empty"
+
+
+def test_new_active_job_clears_cached_mow_path() -> None:
+    """An observed idle-to-working transition starts a new route session."""
+    device = MowingDevice(name="Yuka-Test")
+    device.map = _make_hash_list_with_int_keys()
+    device.report_data.dev.sys_status = WorkMode.MODE_READY
+
+    device.update_report_data(
+        ReportInfoData(
+            dev=RptDevStatus(sys_status=WorkMode.MODE_WORKING),
+            work=RptWork(path_hash=0, ub_path_hash=1),
+        )
+    )
+
+    assert device.map.current_mow_path == {}
+
+
+def test_active_restart_preserves_current_mow_path() -> None:
+    """A same-job active report after restore must keep native route state."""
+    device = MowingDevice(name="Yuka-Test")
+    device.map = _make_hash_list_with_int_keys()
+    device.report_data.dev.sys_status = WorkMode.MODE_WORKING
+
+    device.update_report_data(
+        ReportInfoData(
+            dev=RptDevStatus(sys_status=WorkMode.MODE_WORKING),
+            work=RptWork(path_hash=0, ub_path_hash=1),
+        )
+    )
+
+    assert device.map.current_mow_path
+
+
+def test_idle_path_hash_one_clears_cached_mow_path() -> None:
+    """The path-hash end sentinel clears a completed route session."""
+    device = MowingDevice(name="Yuka-Test")
+    device.map = _make_hash_list_with_int_keys()
+    device.report_data.dev.sys_status = WorkMode.MODE_WORKING
+
+    device.update_report_data(
+        ReportInfoData(
+            dev=RptDevStatus(sys_status=WorkMode.MODE_READY),
+            work=RptWork(path_hash=1, ub_path_hash=0),
+        )
+    )
+
+    assert device.map.current_mow_path == {}
 
 
 # ===========================================================================

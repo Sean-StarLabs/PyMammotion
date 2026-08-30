@@ -307,6 +307,7 @@ class DeviceHandle:
         self._last_report_data_at: float = 0.0
         #: Signalled on each such frame so waiters don't have to poll the timestamp.
         self._report_data_event: asyncio.Event = asyncio.Event()
+        self._last_route_transaction_id = 0
         # Wire up critical error propagation from queue
         self.queue.on_critical_error = self._on_critical_error
 
@@ -330,6 +331,12 @@ class DeviceHandle:
     def commands(self) -> MammotionCommand:
         """Return a MammotionCommand builder for this device."""
         return MammotionCommand(self.device_name, self.user_account)
+
+    def next_route_transaction_id(self) -> int:
+        """Return a per-device, strictly increasing route transaction ID."""
+        transaction_id = max(int(time.time() * 1000), self._last_route_transaction_id + 1)
+        self._last_route_transaction_id = transaction_id
+        return transaction_id
 
     def _wire_transport(self, transport: Transport) -> None:
         """Wire callbacks on a transport and register it."""
@@ -440,7 +447,13 @@ class DeviceHandle:
 
         await self.queue.enqueue(_send_report_cfg, priority=Priority.BACKGROUND, skip_if_saga_active=True)
 
-    async def _send_marked(self, transport: Transport, payload: bytes) -> None:
+    async def _send_marked(
+        self,
+        transport: Transport,
+        payload: bytes,
+        *,
+        before_send: Callable[[], None] | None = None,
+    ) -> None:
         """Send *payload* on *transport* and record the send time.
 
         Call this instead of ``transport.send()`` from any path that a
@@ -475,6 +488,8 @@ class DeviceHandle:
             if since_sync > _MQTT_SYNC_INTERVAL:
                 await self._send_mqtt_sync(transport, since_sync=since_sync)
 
+        if before_send is not None:
+            before_send()
         await transport.send(payload, iot_id=self.iot_id, firmware_version=version)
         if not self._stopping:
             await self._sent_bus.emit(payload)
@@ -868,6 +883,10 @@ class DeviceHandle:
     ) -> None:
         """Enqueue a saga for exclusive execution."""
         await self.queue.enqueue_saga(saga, self.broker, on_complete=on_complete)
+
+    async def interrupt_sagas(self) -> bool:
+        """Give an immediate user command priority over map-transfer sagas."""
+        return await self.queue.interrupt_sagas()
 
     def has_queued_commands(self) -> bool:
         """Return True if the queue has pending work or a saga is active."""
@@ -1285,6 +1304,19 @@ class DeviceHandle:
             except TimeoutError:
                 return False
 
+    async def wait_for_report_data(self, timeout: float, *, since: float) -> bool:
+        """Wait for device telemetry newer than *since*."""
+        return await self._wait_for_report_data(timeout, since=since)
+
+    async def ensure_fresh_report_data(self, *, max_age_s: float = 5.0, timeout: float = 10.0) -> bool:
+        """Ensure the state model has recent device-reported telemetry."""
+        if self._last_report_data_at and (time.monotonic() - self._last_report_data_at <= max_age_s):
+            return True
+
+        before = self._last_report_data_at
+        await self.request_reports(count=1)
+        return await self._wait_for_report_data(timeout, since=before)
+
     async def request_report_snapshot(self) -> None:
         """Fire a one-shot count=1 report — no-op while BLE continuous stream is active.
 
@@ -1700,7 +1732,13 @@ class DeviceHandle:
                     exc_info=True,
                 )
 
-    async def send_raw(self, payload: bytes, *, prefer_ble: bool | None = None) -> None:
+    async def send_raw(
+        self,
+        payload: bytes,
+        *,
+        prefer_ble: bool | None = None,
+        before_send: Callable[[], None] | None = None,
+    ) -> None:
         """Send raw bytes via the best available transport, with BLE fallback on offline."""
         _logger.debug(
             "send_raw '%s': %d bytes prefer_ble=%s transports=%s",
@@ -1740,7 +1778,7 @@ class DeviceHandle:
                 raise
         _logger.debug("send_raw '%s': sending via %s", self.device_name, transport.transport_type.value)
         try:
-            await self._send_marked(transport, payload)
+            await self._send_marked(transport, payload, before_send=before_send)
         except TransportRateLimitedError:
             _logger.warning(
                 "send_raw '%s': transport rate-limited — send blocked (%.0fs until sends resume)",
@@ -1754,12 +1792,12 @@ class DeviceHandle:
             ble = self._on_device_offline(transport)
             if ble is None:
                 raise
-            await self._send_marked(ble, payload)
+            await self._send_marked(ble, payload, before_send=before_send)
         except DeviceUnboundException:
             ble = await self._on_device_unbound(transport)
             if ble is None:
                 raise
-            await self._send_marked(ble, payload)
+            await self._send_marked(ble, payload, before_send=before_send)
         except TransportError:
             if transport.transport_type is not TransportType.BLE:
                 raise
@@ -1775,7 +1813,7 @@ class DeviceHandle:
                 self.device_name,
                 mqtt.transport_type.value,
             )
-            await self._send_marked(mqtt, payload)
+            await self._send_marked(mqtt, payload, before_send=before_send)
 
     # ------------------------------------------------------------------
     # Error bus
@@ -1822,11 +1860,11 @@ class DeviceHandle:
 
     @property
     def mow_path_fetch_enabled(self) -> bool:
-        """True if MowPathSaga is allowed to run over MQTT."""
+        """True if native mow-path fetching is enabled."""
         return self._mow_path_fetch_enabled
 
     def set_mow_path_fetch_enabled(self, *, value: bool) -> None:
-        """Gate MowPathSaga fetches over MQTT. BLE fetches are never gated."""
+        """Enable or disable native mow-path fetching on every transport."""
         self._mow_path_fetch_enabled = value
 
     @property

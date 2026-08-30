@@ -58,6 +58,7 @@ class GenerateRouteInformation:
     toward_mode: int = 0  # angle type relative etc
     edge_mode: int = 1  # border laps
     obstacle_laps: int = 1
+    path_hash: int = 0
 
     @classmethod
     def from_current_task_settings(cls, settings: CurrentTaskSettings) -> GenerateRouteInformation:
@@ -98,6 +99,7 @@ class GenerateRouteInformation:
             toward_mode=settings.toward_mode,
             edge_mode=settings.edge_mode,
             obstacle_laps=decoded.obstacle_laps,
+            path_hash=settings.path_hash,
         )
 
     @staticmethod

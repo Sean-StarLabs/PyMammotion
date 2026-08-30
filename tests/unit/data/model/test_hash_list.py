@@ -20,11 +20,50 @@ from pymammotion.data.model.hash_list import (
     AreaHashNameList,
     FrameList,
     HashList,
+    MowPath,
     NavGetCommData,
     NavGetHashListData,
     NavNameTime,
     PathType,
 )
+
+
+def test_update_mow_path_rejects_failed_transfer() -> None:
+    """A failed cover-path response must not become cached saga progress."""
+    hash_list = HashList()
+
+    hash_list.update_mow_path(MowPath(result=1, total_frame=0, current_frame=1, transaction_id=42))
+
+    assert hash_list.current_mow_path == {}
+
+
+def test_update_mow_path_does_not_delete_data_on_residual_failure() -> None:
+    """A delayed failure frame must not delete an earlier valid transaction."""
+    hash_list = HashList()
+    hash_list.update_mow_path(MowPath(result=0, total_frame=2, current_frame=1, transaction_id=42))
+
+    hash_list.update_mow_path(MowPath(result=1, total_frame=0, current_frame=2, transaction_id=42))
+
+    assert 42 in hash_list.current_mow_path
+    assert 1 in hash_list.current_mow_path[42]
+
+
+def test_invalidate_mow_path_clears_all_native_route_geometry() -> None:
+    """Ending a job clears cover-path and dynamics-line state together."""
+    hash_list = HashList()
+    hash_list.current_mow_path = {42: {1: MowPath(total_frame=1)}}
+    hash_list.generated_mow_path_geojson = {"type": "FeatureCollection"}
+    hash_list.generated_mow_progress_geojson = {"type": "FeatureCollection"}
+    hash_list.dynamics_line = [object()]  # type: ignore[list-item]
+    hash_list.generated_dynamics_line_geojson = {"type": "FeatureCollection"}
+
+    hash_list.invalidate_mow_path(0)
+
+    assert hash_list.current_mow_path == {}
+    assert hash_list.generated_mow_path_geojson == {}
+    assert hash_list.generated_mow_progress_geojson == {}
+    assert hash_list.dynamics_line == []
+    assert hash_list.generated_dynamics_line_geojson == {}
 
 
 # ---------------------------------------------------------------------------
@@ -162,11 +201,13 @@ class TestAreaOnly:
         assert result[0].hash == 10
 
     def test_multiple_unnamed_areas_numbered_sequentially(self) -> None:
-        hl = _make_hash_list(area={
-            10: _make_empty_frame_list(),
-            20: _make_empty_frame_list(),
-            30: _make_empty_frame_list(),
-        })
+        hl = _make_hash_list(
+            area={
+                10: _make_empty_frame_list(),
+                20: _make_empty_frame_list(),
+                30: _make_empty_frame_list(),
+            }
+        )
         result = hl.computed_areas
         names = {a.name for a in result}
         assert names == {"Area 1", "Area 2", "Area 3"}
@@ -411,9 +452,7 @@ class TestUpsertAreaName:
         assert hl.area_name == [AreaHashNameList(name="Front Lawn", hash=123)]
 
     def test_update_in_place_when_hash_present(self) -> None:
-        hl = _make_hash_list(
-            area_name=[AreaHashNameList(name="Front Lawn", hash=123)]
-        )
+        hl = _make_hash_list(area_name=[AreaHashNameList(name="Front Lawn", hash=123)])
         hl.upsert_area_name(123, "Back Lawn")
         # Same single entry, name replaced — no duplicate appended.
         assert hl.area_name == [AreaHashNameList(name="Back Lawn", hash=123)]
