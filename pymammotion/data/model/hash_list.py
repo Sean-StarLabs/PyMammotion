@@ -18,6 +18,13 @@ if TYPE_CHECKING:
     from pymammotion.data.model.location import Dock, LocationPoint
 
 
+def effective_path_hash(path_hash: int, ub_path_hash: int) -> int:
+    """Return the active task hash from normal or breakpoint telemetry."""
+    if path_hash not in (0, 1):
+        return path_hash
+    return ub_path_hash if ub_path_hash not in (0, 1) else 0
+
+
 class PathType(IntEnum):
     """``type`` field values for NavGetCommData / NavGetCommDataAck.
 
@@ -426,6 +433,8 @@ class HashList(DataClassORJSONMixin):
     (x, y) pairs in device-local coordinates.  Replaced wholesale on each
     successful fetch; empty when no session is active.
     """
+    dynamics_line_path_hash: int = 0
+    """Effective task hash captured with the latest dynamics-line fetch."""
     generated_dynamics_line_geojson: dict[str, Any] = field(default_factory=dict)
     """WGS-84 LineString of ``dynamics_line``, regenerated after each fetch."""
     generated_mow_progress_geojson: dict[str, Any] = field(default_factory=dict)
@@ -844,6 +853,7 @@ class HashList(DataClassORJSONMixin):
         if hash_data.type == PathType.DYNAMICS_LINE:
             if hash_data.current_frame == 1:
                 self.dynamics_line = []
+                self.dynamics_line_path_hash = 0
             self.dynamics_line.extend(hash_data.data_couple)
             return True
 
@@ -865,12 +875,13 @@ class HashList(DataClassORJSONMixin):
         bucket = self.unknown_type_frames.setdefault(hash_data.type, {})
         return self._add_hash_data(bucket, hash_data)
 
-    def update_dynamics_line(self, points: list[CommDataCouple]) -> None:
+    def update_dynamics_line(self, points: list[CommDataCouple], path_hash: int = 0) -> None:
         """Replace ``dynamics_line`` with *points*.
 
         The device always returns the full current-session path, not a delta.
         """
         self.dynamics_line = points
+        self.dynamics_line_path_hash = path_hash
 
     def find_missing_mow_path_frames(self) -> dict[int, list[int]]:
         """Return ``{transaction_id: [missing_frame, …]}`` for incomplete transactions only."""
@@ -1060,6 +1071,7 @@ class HashList(DataClassORJSONMixin):
             self.generated_mow_path_geojson = {}
             self.generated_mow_progress_geojson = {}
             self.dynamics_line = []
+            self.dynamics_line_path_hash = 0
             self.generated_dynamics_line_geojson = {}
             self.last_ub_path_hash = 0
 

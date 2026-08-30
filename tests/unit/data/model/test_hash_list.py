@@ -25,6 +25,7 @@ from pymammotion.data.model.hash_list import (
     NavGetHashListData,
     NavNameTime,
     PathType,
+    effective_path_hash,
 )
 
 
@@ -55,6 +56,7 @@ def test_invalidate_mow_path_clears_all_native_route_geometry() -> None:
     hash_list.generated_mow_path_geojson = {"type": "FeatureCollection"}
     hash_list.generated_mow_progress_geojson = {"type": "FeatureCollection"}
     hash_list.dynamics_line = [object()]  # type: ignore[list-item]
+    hash_list.dynamics_line_path_hash = 123
     hash_list.generated_dynamics_line_geojson = {"type": "FeatureCollection"}
 
     hash_list.invalidate_mow_path(0)
@@ -63,7 +65,26 @@ def test_invalidate_mow_path_clears_all_native_route_geometry() -> None:
     assert hash_list.generated_mow_path_geojson == {}
     assert hash_list.generated_mow_progress_geojson == {}
     assert hash_list.dynamics_line == []
+    assert hash_list.dynamics_line_path_hash == 0
     assert hash_list.generated_dynamics_line_geojson == {}
+
+
+def test_update_dynamics_line_records_task_hash() -> None:
+    """Dynamics-line geometry is associated with the task that supplied it."""
+    hash_list = HashList()
+
+    hash_list.update_dynamics_line([], 123)
+
+    assert hash_list.dynamics_line_path_hash == 123
+    restored = HashList.from_dict(hash_list.to_dict())
+    assert restored.dynamics_line_path_hash == 123
+
+
+def test_effective_path_hash_prefers_route_then_breakpoint() -> None:
+    """Normal route hashes win, with the breakpoint hash as fallback."""
+    assert effective_path_hash(123, 456) == 123
+    assert effective_path_hash(1, 456) == 456
+    assert effective_path_hash(0, 1) == 0
 
 
 # ---------------------------------------------------------------------------

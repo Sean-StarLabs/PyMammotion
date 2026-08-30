@@ -56,7 +56,7 @@ from pymammotion.auth.token_manager import MQTTCredentials, TokenManager
 from pymammotion.bluetooth.manager import BLETransportManager
 from pymammotion.data.model import GenerateRouteInformation
 from pymammotion.data.model.device import MowerDevice, MowingDevice, RTKBaseStationDevice, create_device
-from pymammotion.data.model.hash_list import PathType
+from pymammotion.data.model.hash_list import PathType, effective_path_hash
 from pymammotion.data.mqtt.status import StatusType
 from pymammotion.device.handle import DeviceHandle, DeviceRegistry
 from pymammotion.device.readiness import get_readiness_checker
@@ -2438,6 +2438,11 @@ class MammotionClient:
         if handle is None:
             _logger.warning("get_dynamics_line: device '%s' not registered", device_name)
             return
+        device = self.get_device_by_name(device_name)
+        if device is None:
+            return
+        requested_work = device.report_data.work
+        requested_path_hash = effective_path_hash(int(requested_work.path_hash), int(requested_work.ub_path_hash))
 
         saga = CommonDataSaga(
             command_builder=handle.commands,
@@ -2449,7 +2454,11 @@ class MammotionClient:
         async def _on_complete() -> None:
             device = self.get_device_by_name(device_name)
             if device is not None and saga.result:
-                device.map.update_dynamics_line(saga.result)
+                work = device.report_data.work
+                current_path_hash = effective_path_hash(int(work.path_hash), int(work.ub_path_hash))
+                if requested_path_hash == 0 or current_path_hash != requested_path_hash:
+                    return
+                device.map.update_dynamics_line(saga.result, requested_path_hash)
                 device.map.apply_dynamics_line_geojson(device.location.RTK)
 
         await handle.enqueue_saga(saga, on_complete=_on_complete)
