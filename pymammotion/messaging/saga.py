@@ -48,6 +48,8 @@ class Saga(ABC):
     step_timeout: float = 15.0
     total_timeout: float = 300.0  # 5-minute hard limit across all attempts
     device_name: str = ""
+    interruptible: bool = False
+    restore_on_failed_preemption: bool = True
 
     @staticmethod
     def extract_frame(
