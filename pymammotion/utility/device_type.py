@@ -269,6 +269,12 @@ class DeviceType(Enum):
             return not _version_less_than(firmware_version, "1.15.3.4422")
         return False
 
+    def is_support_dynamics_line_polling(self, firmware_version: str | None = None) -> bool:
+        """Return whether periodic type-18 dynamics fetches are verified."""
+        if self is DeviceType.YUKA_ML:
+            return False
+        return self.is_support_dynamics_line(firmware_version)
+
     def is_rtk_type(self) -> bool:
         """Return True if this is any RTK device (instance version of is_rtk)."""
         return self in (

@@ -86,7 +86,7 @@ async def dynamics_line_loop(handle: DeviceHandle) -> None:
 
         # Re-check on every tick — LUBA_VA depends on firmware version which
         # may not be known until reports start arriving.
-        if not device_type.is_support_dynamics_line(_main_controller_version(handle)):
+        if not device_type.is_support_dynamics_line_polling(_main_controller_version(handle)):
             continue
 
         await _enqueue_dynamics_line_saga(handle)
