@@ -9,10 +9,16 @@ sub-task in the current design (work runs directly in the processor task).
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
+from pymammotion.aliyun.exceptions import GatewayTimeoutException
 from pymammotion.messaging.broker import DeviceMessageBroker
 from pymammotion.messaging.command_queue import DeviceCommandQueue, Priority
+from pymammotion.messaging.dynamics_line_saga import DynamicsLineSaga
 from pymammotion.messaging.saga import Saga
+from pymammotion.transport.base import NoTransportAvailableError, ReLoginRequiredError
 
 
 class _CrashingSaga(Saga):
@@ -40,6 +46,44 @@ class _SlowSaga(Saga):
     async def _run(self, broker: DeviceMessageBroker) -> None:
         self.started.set()
         await asyncio.sleep(60.0)
+
+
+class _BlockingSaga(Saga):
+    """Saga held by a test-controlled release event."""
+
+    name = "blocking"
+
+    def __init__(self, *, interruptible: bool) -> None:
+        super().__init__()
+        self.interruptible = interruptible
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.cancelled = asyncio.Event()
+        self.finished = asyncio.Event()
+
+    async def _run(self, broker: DeviceMessageBroker) -> None:
+        self.started.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+        self.finished.set()
+
+
+class _TrackingReadSaga(Saga):
+    """Read saga that records its execution order."""
+
+    name = "tracking_read"
+    interruptible = True
+
+    def __init__(self, order: list[str], label: str) -> None:
+        super().__init__()
+        self._order = order
+        self._label = label
+
+    async def _run(self, broker: DeviceMessageBroker) -> None:
+        self._order.append(self._label)
 
 
 async def test_saga_exception_releases_exclusive_lock() -> None:
@@ -164,3 +208,646 @@ async def test_saga_ownership_covers_completion_callback() -> None:
         assert q.is_saga_active is False
     finally:
         await q.stop()
+
+
+async def test_preemption_waits_for_interruptible_saga_publication() -> None:
+    """A completed transfer's publication cannot be cancelled as stale read I/O."""
+    q = DeviceCommandQueue(device_name="dev-publish")
+    broker = DeviceMessageBroker()
+    callback_started = asyncio.Event()
+    release_callback = asyncio.Event()
+    callback_finished = asyncio.Event()
+    command_ran = asyncio.Event()
+
+    class _QuickReadSaga(Saga):
+        name = "quick_read"
+        interruptible = True
+
+        async def _run(self, _broker: DeviceMessageBroker) -> None:
+            return None
+
+    async def on_complete() -> None:
+        callback_started.set()
+        await release_callback.wait()
+        callback_finished.set()
+
+    q.start()
+    try:
+        await q.enqueue_saga(_QuickReadSaga(), broker, on_complete=on_complete)
+        await asyncio.wait_for(callback_started.wait(), timeout=2.0)
+
+        command = asyncio.create_task(q.run_after_preempting_reads(lambda: _set_event(command_ran)))
+        await asyncio.sleep(0.05)
+
+        assert not command_ran.is_set()
+        assert not callback_finished.is_set()
+        release_callback.set()
+        await asyncio.wait_for(command, timeout=2.0)
+
+        assert callback_finished.is_set()
+        assert command_ran.is_set()
+    finally:
+        await q.stop()
+
+
+async def test_user_command_cancels_active_read_saga() -> None:
+    """A user command preempts an active read and runs after its cleanup."""
+    q = DeviceCommandQueue(device_name="dev-read")
+    broker = DeviceMessageBroker()
+    saga = _BlockingSaga(interruptible=True)
+    command_ran = asyncio.Event()
+    q.start()
+    try:
+        await q.enqueue_saga(saga, broker)
+        await asyncio.wait_for(saga.started.wait(), timeout=2.0)
+
+        await q.run_after_preempting_reads(lambda: _set_event(command_ran))
+
+        assert saga.cancelled.is_set()
+        assert command_ran.is_set()
+        assert q.is_saga_active is False
+    finally:
+        await q.stop()
+
+
+async def test_user_command_cancels_active_dynamics_line_read() -> None:
+    """Periodic dynamics reads yield immediately to an interactive command."""
+    q = DeviceCommandQueue(device_name="dev-dynamics")
+    broker = DeviceMessageBroker()
+    saga = DynamicsLineSaga(
+        MagicMock(),
+        AsyncMock(),
+        get_mow_session_id=lambda: 3,
+    )
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    command_ran = asyncio.Event()
+
+    async def blocking_run(_broker: DeviceMessageBroker) -> None:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    saga._run = blocking_run  # type: ignore[method-assign]
+    q.start()
+    try:
+        await q.enqueue_saga(saga, broker)
+        await asyncio.wait_for(started.wait(), timeout=2.0)
+
+        await q.run_after_preempting_reads(lambda: _set_event(command_ran))
+
+        assert cancelled.is_set()
+        assert command_ran.is_set()
+        assert q.is_saga_active is False
+    finally:
+        await q.stop()
+
+
+async def test_user_command_waits_for_non_interruptible_write() -> None:
+    """A user command cannot interleave with an active write saga."""
+    q = DeviceCommandQueue(device_name="dev-write")
+    broker = DeviceMessageBroker()
+    saga = _BlockingSaga(interruptible=False)
+    command_ran = asyncio.Event()
+    q.start()
+    try:
+        await q.enqueue_saga(saga, broker)
+        await asyncio.wait_for(saga.started.wait(), timeout=2.0)
+        command = asyncio.create_task(q.run_after_preempting_reads(lambda: _set_event(command_ran)))
+        await asyncio.sleep(0)
+
+        assert not command_ran.is_set()
+        assert not saga.cancelled.is_set()
+
+        saga.release.set()
+        await asyncio.wait_for(command, timeout=2.0)
+        assert saga.finished.is_set()
+        assert command_ran.is_set()
+    finally:
+        await q.stop()
+
+
+async def test_user_command_orders_before_new_read_sagas() -> None:
+    """Stale reads are discarded and later reads follow the user command."""
+    q = DeviceCommandQueue(device_name="dev-order")
+    broker = DeviceMessageBroker()
+    order: list[str] = []
+    await q.enqueue_saga(_TrackingReadSaga(order, "stale"), broker)
+
+    command = asyncio.create_task(q.run_after_preempting_reads(lambda: _append(order, "command")))
+    await asyncio.sleep(0)
+    await q.enqueue_saga(_TrackingReadSaga(order, "new"), broker)
+    q.start()
+    try:
+        await asyncio.wait_for(command, timeout=2.0)
+        await asyncio.sleep(0.1)
+        assert order == ["command", "new"]
+    finally:
+        await q.stop()
+
+
+async def test_user_command_keeps_older_write_saga_ahead() -> None:
+    """Preemption skips reads without overtaking an already-queued write."""
+    q = DeviceCommandQueue(device_name="dev-write-order")
+    broker = DeviceMessageBroker()
+    order: list[str] = []
+
+    class _TrackingWriteSaga(Saga):
+        name = "tracking_write"
+
+        async def _run(self, _broker: DeviceMessageBroker) -> None:
+            order.append("write")
+
+    await q.enqueue_saga(_TrackingWriteSaga(), broker)
+    command = asyncio.create_task(q.run_after_preempting_reads(lambda: _append(order, "command")))
+    await asyncio.sleep(0)
+    q.start()
+    try:
+        await asyncio.wait_for(command, timeout=2.0)
+        assert order == ["write", "command"]
+    finally:
+        await q.stop()
+
+
+async def test_preemption_during_saga_start_discards_read() -> None:
+    """A read invalidated while its start hook awaits never begins transfer I/O."""
+    q = DeviceCommandQueue(device_name="dev-start-race")
+    broker = DeviceMessageBroker()
+    saga = _TrackingReadSaga([], "read")
+    hook_started = asyncio.Event()
+    release_hook = asyncio.Event()
+    command_ran = asyncio.Event()
+
+    async def on_start() -> None:
+        hook_started.set()
+        await release_hook.wait()
+
+    q.on_saga_start = on_start
+    q.start()
+    try:
+        await q.enqueue_saga(saga, broker)
+        await asyncio.wait_for(hook_started.wait(), timeout=2.0)
+        command = asyncio.create_task(q.run_after_preempting_reads(lambda: _set_event(command_ran)))
+        await asyncio.sleep(0)
+        release_hook.set()
+        await asyncio.wait_for(command, timeout=2.0)
+
+        assert saga._order == []  # noqa: SLF001
+        assert command_ran.is_set()
+    finally:
+        await q.stop()
+
+
+async def test_preempting_command_retries_gateway_timeouts() -> None:
+    """Preempting commands retain the queue's three-attempt retry behavior."""
+    q = DeviceCommandQueue(device_name="dev-retry")
+    attempts = 0
+
+    async def work() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise GatewayTimeoutException(20056, "iot-1")
+
+    q.start()
+    try:
+        await q.run_after_preempting_reads(work)
+        assert attempts == 3
+    finally:
+        await q.stop()
+
+
+async def test_preempting_command_reports_final_gateway_timeout() -> None:
+    """The caller receives the timeout after the queue exhausts its retries."""
+    q = DeviceCommandQueue(device_name="dev-retry-fail")
+    attempts = 0
+
+    async def work() -> None:
+        nonlocal attempts
+        attempts += 1
+        raise GatewayTimeoutException(20056, "iot-1")
+
+    q.start()
+    try:
+        with pytest.raises(GatewayTimeoutException):
+            await q.run_after_preempting_reads(work)
+        assert attempts == 3
+    finally:
+        await q.stop()
+
+
+async def test_cancelled_preempting_command_does_not_run_later() -> None:
+    """Caller cancellation invalidates work queued behind a write saga."""
+    q = DeviceCommandQueue(device_name="dev-cancel-command")
+    broker = DeviceMessageBroker()
+    saga = _BlockingSaga(interruptible=False)
+    command_ran = asyncio.Event()
+    q.start()
+    try:
+        await q.enqueue_saga(saga, broker)
+        await asyncio.wait_for(saga.started.wait(), timeout=2.0)
+        command = asyncio.create_task(q.run_after_preempting_reads(lambda: _set_event(command_ran)))
+        await asyncio.sleep(0)
+
+        command.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await command
+        saga.release.set()
+        await asyncio.wait_for(saga.finished.wait(), timeout=2.0)
+        await asyncio.sleep(0.05)
+
+        assert not command_ran.is_set()
+    finally:
+        await q.stop()
+
+
+async def test_cancelled_preempting_command_does_not_run_after_reconnect() -> None:
+    """Cancellation while the processor waits at the gate prevents a later send."""
+    q = DeviceCommandQueue(device_name="dev-cancel-gate")
+    command_ran = asyncio.Event()
+    q.pause_for_reconnect()
+    q.start()
+    try:
+        command = asyncio.create_task(q.run_after_preempting_reads(lambda: _set_event(command_ran)))
+        await asyncio.sleep(0)
+
+        command.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await command
+        q.resume_after_reconnect()
+        await asyncio.sleep(0.05)
+
+        assert not command_ran.is_set()
+    finally:
+        await q.stop()
+
+
+async def test_cancelled_preempting_command_cancels_active_work() -> None:
+    """Caller cancellation propagates into an already-dispatched request."""
+    q = DeviceCommandQueue(device_name="dev-cancel-active")
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def work() -> None:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    q.start()
+    try:
+        command = asyncio.create_task(q.run_after_preempting_reads(work))
+        await asyncio.wait_for(started.wait(), timeout=2.0)
+        command.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await command
+        await asyncio.wait_for(cancelled.wait(), timeout=2.0)
+
+        follow_up = asyncio.Event()
+        await q.enqueue(lambda: _set_event(follow_up))
+        await asyncio.wait_for(follow_up.wait(), timeout=2.0)
+    finally:
+        await q.stop()
+
+
+async def test_cancelled_preemption_restores_active_read() -> None:
+    """A speculative read cancellation is undone when the command never runs."""
+    q = DeviceCommandQueue(device_name="dev-restore-read")
+    broker = DeviceMessageBroker()
+    runs = 0
+    first_started = asyncio.Event()
+    first_cancelled = asyncio.Event()
+    restarted = asyncio.Event()
+    release = asyncio.Event()
+    command_ran = asyncio.Event()
+
+    class _RestartableRead(Saga):
+        name = "restartable"
+        interruptible = True
+
+        async def _run(self, _broker: DeviceMessageBroker) -> None:
+            nonlocal runs
+            runs += 1
+            if runs == 1:
+                first_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    first_cancelled.set()
+                    raise
+            restarted.set()
+            await release.wait()
+
+    q.start()
+    try:
+        await q.enqueue_saga(_RestartableRead(), broker)
+        await asyncio.wait_for(first_started.wait(), timeout=2.0)
+        q.pause_for_reconnect()
+        command = asyncio.create_task(q.run_after_preempting_reads(lambda: _set_event(command_ran)))
+        await asyncio.wait_for(first_cancelled.wait(), timeout=2.0)
+
+        command.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await command
+        q.resume_after_reconnect()
+
+        await asyncio.wait_for(restarted.wait(), timeout=2.0)
+        assert not command_ran.is_set()
+        release.set()
+    finally:
+        await q.stop()
+
+
+async def test_failed_preemption_restores_active_read() -> None:
+    """A read canceled for a command is restored when delivery was impossible."""
+    q = DeviceCommandQueue(device_name="dev-restore-failed-read")
+    broker = DeviceMessageBroker()
+    runs = 0
+    first_started = asyncio.Event()
+    restarted = asyncio.Event()
+    release = asyncio.Event()
+
+    class _RestartableRead(Saga):
+        name = "restartable"
+        interruptible = True
+
+        async def _run(self, _broker: DeviceMessageBroker) -> None:
+            nonlocal runs
+            runs += 1
+            if runs == 1:
+                first_started.set()
+                await asyncio.Event().wait()
+            restarted.set()
+            await release.wait()
+
+    async def fail() -> None:
+        raise NoTransportAvailableError("offline")
+
+    q.start()
+    try:
+        await q.enqueue_saga(_RestartableRead(), broker)
+        await asyncio.wait_for(first_started.wait(), timeout=2.0)
+
+        with pytest.raises(NoTransportAvailableError):
+            await q.run_after_preempting_reads(fail)
+
+        await asyncio.wait_for(restarted.wait(), timeout=2.0)
+        release.set()
+    finally:
+        await q.stop()
+
+
+async def test_failed_preemption_does_not_restore_tokenless_dynamics_read(caplog: pytest.LogCaptureFixture) -> None:
+    """A failed command leaves type-18 recovery to the next polling cadence."""
+    q = DeviceCommandQueue(device_name="dev-no-restore-dynamics")
+    broker = DeviceMessageBroker()
+    saga = DynamicsLineSaga(MagicMock(), AsyncMock(), get_mow_session_id=lambda: 3)
+    runs = 0
+    started = asyncio.Event()
+
+    async def blocking_run(_broker: DeviceMessageBroker) -> None:
+        nonlocal runs
+        runs += 1
+        started.set()
+        await asyncio.Event().wait()
+
+    async def fail() -> None:
+        raise NoTransportAvailableError("offline")
+
+    saga._run = blocking_run  # type: ignore[method-assign]
+    q.start()
+    try:
+        await q.enqueue_saga(saga, broker)
+        await asyncio.wait_for(started.wait(), timeout=2.0)
+
+        with pytest.raises(NoTransportAvailableError):
+            await q.run_after_preempting_reads(fail)
+        await asyncio.sleep(0.05)
+
+        assert runs == 1
+        assert "failed to restore preempted read saga" not in caplog.text
+    finally:
+        await q.stop()
+
+
+async def test_uncertain_command_timeout_does_not_restore_active_read() -> None:
+    """An ACK timeout cannot resume a read with stale task assumptions."""
+    q = DeviceCommandQueue(device_name="dev-uncertain-command")
+    broker = DeviceMessageBroker()
+    runs = 0
+    first_started = asyncio.Event()
+
+    class _RestartableRead(Saga):
+        name = "uncertain_read"
+        interruptible = True
+
+        async def _run(self, _broker: DeviceMessageBroker) -> None:
+            nonlocal runs
+            runs += 1
+            first_started.set()
+            await asyncio.Event().wait()
+
+    async def timeout() -> None:
+        raise GatewayTimeoutException(20056, "iot-1")
+
+    q.start()
+    try:
+        await q.enqueue_saga(_RestartableRead(), broker)
+        await asyncio.wait_for(first_started.wait(), timeout=2.0)
+
+        with pytest.raises(GatewayTimeoutException):
+            await q.run_after_preempting_reads(timeout)
+        await asyncio.sleep(0.05)
+
+        assert runs == 1
+    finally:
+        await q.stop()
+
+
+async def test_later_success_invalidates_read_restored_by_overlapping_failure() -> None:
+    """A restored read keeps its original generation across overlapping commands."""
+    q = DeviceCommandQueue(device_name="dev-restore-generation")
+    broker = DeviceMessageBroker()
+    runs = 0
+    started = asyncio.Event()
+
+    class _RestartableRead(Saga):
+        name = "generation_read"
+        interruptible = True
+
+        async def _run(self, _broker: DeviceMessageBroker) -> None:
+            nonlocal runs
+            runs += 1
+            started.set()
+            await asyncio.Event().wait()
+
+    async def fail() -> None:
+        raise NoTransportAvailableError("offline")
+
+    q.start()
+    try:
+        await q.enqueue_saga(_RestartableRead(), broker)
+        await asyncio.wait_for(started.wait(), timeout=2.0)
+
+        failed = asyncio.create_task(q.run_after_preempting_reads(fail))
+        succeeded = asyncio.create_task(q.run_after_preempting_reads(lambda: _append([], "sent")))
+        with pytest.raises(NoTransportAvailableError):
+            await failed
+        await asyncio.wait_for(succeeded, timeout=2.0)
+        await asyncio.sleep(0.05)
+
+        assert runs == 1
+    finally:
+        await q.stop()
+
+
+async def test_overlapping_failures_restore_read_once() -> None:
+    """Concurrent failed commands cannot enqueue duplicate read restorations."""
+    q = DeviceCommandQueue(device_name="dev-restore-dedup")
+    broker = DeviceMessageBroker()
+    runs = 0
+    first_started = asyncio.Event()
+    restarted = asyncio.Event()
+    release = asyncio.Event()
+
+    class _RestartableRead(Saga):
+        name = "dedup_read"
+        interruptible = True
+
+        async def _run(self, _broker: DeviceMessageBroker) -> None:
+            nonlocal runs
+            runs += 1
+            if runs == 1:
+                first_started.set()
+                await asyncio.Event().wait()
+            restarted.set()
+            await release.wait()
+
+    async def fail() -> None:
+        raise NoTransportAvailableError("offline")
+
+    q.start()
+    try:
+        await q.enqueue_saga(_RestartableRead(), broker)
+        await asyncio.wait_for(first_started.wait(), timeout=2.0)
+
+        commands = [asyncio.create_task(q.run_after_preempting_reads(fail)) for _ in range(2)]
+        results = await asyncio.gather(*commands, return_exceptions=True)
+        assert all(isinstance(result, NoTransportAvailableError) for result in results)
+        await asyncio.wait_for(restarted.wait(), timeout=2.0)
+        await asyncio.sleep(0.05)
+
+        assert runs == 2
+        release.set()
+    finally:
+        await q.stop()
+
+
+async def test_cancelled_preemption_keeps_older_queued_read() -> None:
+    """Queued reads are invalidated only after the user command succeeds."""
+    q = DeviceCommandQueue(device_name="dev-keep-read")
+    broker = DeviceMessageBroker()
+    order: list[str] = []
+    await q.enqueue_saga(_TrackingReadSaga(order, "read"), broker)
+    q.pause_for_reconnect()
+    command = asyncio.create_task(q.run_after_preempting_reads(lambda: _append(order, "command")))
+    await asyncio.sleep(0)
+    q.start()
+    try:
+        await asyncio.sleep(0)
+        command.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await command
+        q.resume_after_reconnect()
+        await asyncio.sleep(0.1)
+
+        assert order == ["read"]
+    finally:
+        await q.stop()
+
+
+async def test_preempting_command_expires_behind_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Preemption priority does not exempt ordinary user commands from TTL."""
+    monkeypatch.setattr("pymammotion.messaging.command_queue._COMMAND_TTL", 0.01)
+    q = DeviceCommandQueue(device_name="dev-expire")
+    broker = DeviceMessageBroker()
+    saga = _BlockingSaga(interruptible=False)
+    command_ran = asyncio.Event()
+    q.start()
+    try:
+        await q.enqueue_saga(saga, broker)
+        await asyncio.wait_for(saga.started.wait(), timeout=2.0)
+        command = asyncio.create_task(q.run_after_preempting_reads(lambda: _set_event(command_ran)))
+        await asyncio.sleep(0.02)
+        saga.release.set()
+
+        with pytest.raises(TimeoutError, match="queued command expired"):
+            await command
+        assert not command_ran.is_set()
+    finally:
+        await q.stop()
+
+
+async def test_stop_cancels_preemption_waiting_behind_write_saga() -> None:
+    """Shutdown releases a caller queued behind non-interruptible work."""
+    q = DeviceCommandQueue(device_name="dev-stop-write")
+    saga = _BlockingSaga(interruptible=False)
+    q.start()
+    await q.enqueue_saga(saga, DeviceMessageBroker())
+    await asyncio.wait_for(saga.started.wait(), timeout=2.0)
+    command = asyncio.create_task(q.run_after_preempting_reads(lambda: _set_event(asyncio.Event())))
+    await asyncio.sleep(0)
+
+    await q.stop()
+
+    with pytest.raises(asyncio.CancelledError):
+        await command
+
+
+async def test_stop_cancels_preemption_waiting_on_transport_gate() -> None:
+    """Shutdown releases a caller held by reconnect gating."""
+    q = DeviceCommandQueue(device_name="dev-stop-gate")
+    q.pause_for_reconnect()
+    q.start()
+    command = asyncio.create_task(q.run_after_preempting_reads(lambda: _set_event(asyncio.Event())))
+    await asyncio.sleep(0)
+
+    await q.stop()
+
+    with pytest.raises(asyncio.CancelledError):
+        await command
+
+
+async def test_preempting_auth_error_notifies_critical_error_and_caller() -> None:
+    """Preempting sends retain ordinary queue auth-error propagation."""
+    q = DeviceCommandQueue(device_name="dev-auth")
+    error = ReLoginRequiredError("account", "expired")
+    q.on_critical_error = AsyncMock()
+
+    async def fail() -> None:
+        raise error
+
+    q.start()
+    try:
+        with pytest.raises(ReLoginRequiredError) as exc_info:
+            await q.run_after_preempting_reads(fail)
+        assert exc_info.value is error
+        q.on_critical_error.assert_awaited_once_with(error)
+    finally:
+        await q.stop()
+
+
+async def _set_event(event: asyncio.Event) -> None:
+    event.set()
+
+
+async def _append(values: list[str], value: str) -> None:
+    values.append(value)
