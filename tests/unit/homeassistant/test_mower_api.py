@@ -222,6 +222,22 @@ def _make_api() -> HomeAssistantMowerApi:
     return api
 
 
+async def test_user_commands_preempt_read_sagas_by_default() -> None:
+    """The HA-facing command path opts user actions into read preemption."""
+    api = _make_api()
+    api._mammotion = MagicMock()
+    api._mammotion.send_command_with_args = AsyncMock()
+    api.update_failures = 0
+
+    assert await api.async_send_command("Yuka-Test", "start_job") is True
+
+    api._mammotion.send_command_with_args.assert_awaited_once_with(
+        "Yuka-Test",
+        "start_job",
+        preempt_reads=True,
+    )
+
+
 def _make_device(*, root_hash_lists: list | None = None, area: dict | None = None, missing: list | None = None):
     """Return a device whose map reports the given completeness."""
     device = MagicMock()

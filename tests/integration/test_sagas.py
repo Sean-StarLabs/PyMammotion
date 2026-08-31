@@ -20,10 +20,13 @@ from pymammotion.data.model.hash_list import (
     RootHashList,
 )
 from pymammotion.messaging.broker import CommandTimeoutError, DeviceMessageBroker
+from pymammotion.messaging.common_data_saga import CommonDataSaga
+from pymammotion.messaging.dynamics_line_saga import DynamicsLineSaga
 from pymammotion.messaging.map_saga import MapFetchSaga
 from pymammotion.messaging.mow_path_saga import MowPathSaga
 from pymammotion.messaging.plan_saga import PlanFetchSaga
 from pymammotion.messaging.saga import SagaFailedError
+from pymammotion.messaging.spino_plan_saga import SpinoPlanFetchSaga
 
 
 # ---------------------------------------------------------------------------
@@ -974,6 +977,28 @@ async def test_mow_path_manifest_does_not_fall_back_to_cached_session() -> None:
         manifest = await saga._fetch_line_hash_list(AsyncMock())  # noqa: SLF001
 
     assert manifest == RootHashList(sub_cmd=3)
+
+
+def test_only_fetch_only_mow_path_saga_is_interruptible() -> None:
+    """Route planning is a write; fetching an existing route is a read."""
+    common = {
+        "command_builder": _make_command_builder(),
+        "send_command": AsyncMock(),
+        "get_map": HashList,
+        "zone_hashs": [],
+    }
+
+    assert MowPathSaga(**common).interruptible is False
+    assert MowPathSaga(**common, skip_planning=True).interruptible is True
+
+
+def test_only_transactionally_staged_read_sagas_are_interruptible() -> None:
+    """Only reads with safely correlated replies may be preempted."""
+    assert MapFetchSaga.interruptible is False
+    assert PlanFetchSaga.interruptible is False
+    assert SpinoPlanFetchSaga.interruptible is False
+    assert CommonDataSaga.interruptible is False
+    assert DynamicsLineSaga.interruptible is True
 
 
 async def test_mow_path_saga_preserves_current_mow_path_across_runs() -> None:

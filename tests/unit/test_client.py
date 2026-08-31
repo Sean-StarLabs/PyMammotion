@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from unittest.mock import ANY, AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
@@ -1042,6 +1043,104 @@ async def test_send_command_with_args_stamps_user_command_on_handle() -> None:
     await client.send_command_with_args("Luba-TS", "start_job")
 
     assert handle._rearm_event.is_set()  # noqa: SLF001
+
+
+async def test_send_command_with_args_can_preempt_read_sagas() -> None:
+    """A preempting fire-and-forget command uses the queue's atomic operation."""
+    client = MammotionClient()
+    mqtt = _make_connected_transport(TransportType.CLOUD_ALIYUN)
+    handle = make_handle("dev1", "Luba-Preempt")
+    await handle.add_transport(mqtt)
+    await client._device_registry.register(handle)
+
+    async def run(work: Callable[[], Awaitable[None]]) -> None:
+        await work()
+
+    handle.run_after_preempting_reads = AsyncMock(side_effect=run)  # type: ignore[method-assign]
+
+    await client.send_command_with_args(
+        "Luba-Preempt",
+        "start_job",
+        preempt_reads=True,
+    )
+
+    handle.run_after_preempting_reads.assert_awaited_once()
+    mqtt.send.assert_awaited_once()
+
+
+async def test_preempting_command_reports_missing_transport() -> None:
+    """A preempting command cannot invalidate reads without being sent."""
+    from pymammotion.transport.base import NoTransportAvailableError  # noqa: PLC0415
+
+    client = MammotionClient()
+    handle = make_handle("dev1", "Luba-Offline")
+    await handle.start()
+    await client._device_registry.register(handle)
+
+    with pytest.raises(NoTransportAvailableError):
+        await client.send_command_with_args(
+            "Luba-Offline",
+            "start_job",
+            preempt_reads=True,
+        )
+
+    await handle.stop()
+
+
+async def test_preempting_command_reports_rate_limited_send() -> None:
+    """A suppressed transport error cannot invalidate preempted reads."""
+    from pymammotion.transport.base import TransportRateLimitedError  # noqa: PLC0415
+
+    client = MammotionClient()
+    mqtt = _make_connected_transport(TransportType.CLOUD_ALIYUN)
+    handle = make_handle("dev1", "Luba-Rate-Limited")
+    await handle.add_transport(mqtt)
+    await handle.start()
+    await client._device_registry.register(handle)
+    handle.send_raw = AsyncMock(side_effect=TransportRateLimitedError("rate limited"))  # type: ignore[method-assign]
+
+    with pytest.raises(TransportRateLimitedError):
+        await client.send_command_with_args(
+            "Luba-Rate-Limited",
+            "start_job",
+            preempt_reads=True,
+        )
+
+    handle.send_raw.assert_awaited_once_with(
+        ANY,
+        prefer_ble=False,
+        raise_on_rate_limit=True,
+    )
+    await handle.stop()
+
+
+async def test_response_waiter_is_registered_at_queued_dispatch() -> None:
+    """A preempting request cannot consume a response while reconnect-gated."""
+    client = MammotionClient()
+    mqtt = _make_connected_transport(TransportType.CLOUD_ALIYUN)
+    handle = make_handle("dev1", "Luba-Waiter")
+    await handle.add_transport(mqtt)
+    await client._device_registry.register(handle)
+    handle.queue.pause_for_reconnect()
+
+    request = asyncio.create_task(
+        client.send_command_and_wait(
+            "Luba-Waiter",
+            "start_job",
+            "some_field",
+            send_timeout=0.1,
+            preempt_reads=True,
+        )
+    )
+    await asyncio.sleep(0)
+
+    assert "some_field" not in handle.broker._pending  # noqa: SLF001
+
+    request.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+    handle.queue.resume_after_reconnect()
+    await handle.stop()
 
 
 async def test_send_command_and_wait_stamps_user_command_on_handle() -> None:
