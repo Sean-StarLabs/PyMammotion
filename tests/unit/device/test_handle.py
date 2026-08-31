@@ -173,6 +173,124 @@ async def test_commit_mow_path_transactions_publishes_staged_manifest() -> None:
     assert handle.snapshot.raw.map.current_mow_path == transactions
 
 
+async def test_commit_mow_path_transactions_rejects_changed_session() -> None:
+    """A completed transfer cannot resurrect a mowing session that has ended."""
+    device = MowerDevice(name="Luba-Route", mow_session_id=2)
+    handle = DeviceHandle(device_id="dev-route", device_name=device.name, initial_device=device)
+    transactions = {20: {1: MowPath(transaction_id=20, current_frame=1, total_frame=1)}}
+
+    committed = await handle.commit_mow_path_transactions(transactions, session_id=1)
+
+    assert committed is False
+    assert handle.snapshot.raw.map.current_mow_path == {}
+
+
+async def test_commit_mow_path_transactions_binds_route_to_current_session() -> None:
+    """A complete transfer records the mowing lifecycle it was fetched for."""
+    device = MowerDevice(name="Luba-Route", mow_session_id=2)
+    handle = DeviceHandle(device_id="dev-route", device_name=device.name, initial_device=device)
+    transactions = {20: {1: MowPath(transaction_id=20, current_frame=1, total_frame=1)}}
+
+    committed = await handle.commit_mow_path_transactions(transactions, session_id=2)
+
+    assert committed is True
+    assert handle.snapshot.raw.map.current_mow_path_session_id == 2
+
+
+async def test_verified_route_replacement_clears_restored_dynamics_line() -> None:
+    """A replacement route cannot retain a live line from an offline prior job."""
+    device = MowerDevice(name="Luba-Route", mow_session_id=2)
+    device.map.dynamics_line = [MagicMock()]
+    device.map.generated_dynamics_line_geojson = {"type": "FeatureCollection"}
+    handle = DeviceHandle(
+        device_id="dev-route", device_name=device.name, initial_device=device
+    )
+    transactions = {
+        20: {1: MowPath(transaction_id=20, current_frame=1, total_frame=1)}
+    }
+
+    committed = await handle.commit_mow_path_transactions(
+        transactions,
+        session_id=2,
+        replace=True,
+        clear_dynamics_line=True,
+    )
+
+    assert committed is True
+    assert handle.snapshot.raw.map.dynamics_line == []
+    assert handle.snapshot.raw.map.generated_dynamics_line_geojson == {}
+
+
+async def test_restored_active_route_waits_for_complete_report_verification() -> None:
+    """A cached active route is untrusted until complete telemetry arrives."""
+    from pymammotion.proto import MctlSys, ReportInfoData, RptDevStatus, RptWork
+    from pymammotion.utility.constant import WorkMode
+
+    device = MowerDevice(name="Luba-Restore", mow_session_id=3)
+    device.report_data.dev.sys_status = WorkMode.MODE_WORKING
+    device.map.current_mow_path = {
+        20: {1: MowPath(transaction_id=20, current_frame=1, total_frame=1)}
+    }
+    device.map.current_mow_path_session_id = 3
+    handle = DeviceHandle(
+        device_id="dev-restore",
+        device_name=device.name,
+        initial_device=MowerDevice(name=device.name),
+    )
+    handle.restore_device(device)
+
+    assert handle.restored_mow_path_verification_session_id is None
+
+    report = RealLubaMsg(
+        sys=MctlSys(
+            toapp_report_data=ReportInfoData(
+                dev=RptDevStatus(
+                    sys_status=WorkMode.MODE_WORKING,
+                    sys_time_stamp=1,
+                ),
+                work=RptWork(path_hash=456),
+            )
+        )
+    )
+    await handle.on_raw_message(bytes(report))
+
+    assert handle.restored_mow_path_verification_session_id == 3
+
+
+async def test_restored_route_is_trusted_after_observed_inactive_report() -> None:
+    """An observed inactive state proves there was no hidden active job."""
+    from pymammotion.proto import MctlSys, ReportInfoData, RptDevStatus, RptWork
+    from pymammotion.utility.constant import WorkMode
+
+    device = MowerDevice(name="Luba-Restore", mow_session_id=3)
+    device.report_data.dev.sys_status = WorkMode.MODE_WORKING
+    device.map.current_mow_path = {
+        20: {1: MowPath(transaction_id=20, current_frame=1, total_frame=1)}
+    }
+    device.map.current_mow_path_session_id = 3
+    handle = DeviceHandle(
+        device_id="dev-restore",
+        device_name=device.name,
+        initial_device=MowerDevice(name=device.name),
+    )
+    handle.restore_device(device)
+
+    report = RealLubaMsg(
+        sys=MctlSys(
+            toapp_report_data=ReportInfoData(
+                dev=RptDevStatus(
+                    sys_status=WorkMode.MODE_READY,
+                    sys_time_stamp=1,
+                ),
+                work=RptWork(path_hash=1),
+            )
+        )
+    )
+    await handle.on_raw_message(bytes(report))
+
+    assert handle.restored_mow_path_verification_session_id is None
+
+
 def test_mow_path_fallback_transaction_ids_are_unique_across_sagas() -> None:
     """Standalone sagas retain timestamp semantics without reusing an ID."""
     kwargs = {

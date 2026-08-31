@@ -25,6 +25,7 @@ from pymammotion.data.model.hash_list import (
     NavNameTime,
     MowPath,
     PathType,
+    RootHashList,
 )
 
 
@@ -91,9 +92,11 @@ def test_commit_mow_path_transactions_is_atomic() -> None:
         }
     }
 
-    hash_list.commit_mow_path_transactions(complete)
+    hash_list.commit_mow_path_transactions(complete, session_id=3)
 
     assert hash_list.current_mow_path == {10: {1: existing}, **complete}
+    assert hash_list.current_mow_path_session_id == 3
+    assert hash_list.has_mow_path_for_session(3)
 
 
 def test_commit_mow_path_transactions_replaces_previous_preview() -> None:
@@ -106,6 +109,21 @@ def test_commit_mow_path_transactions_replaces_previous_preview() -> None:
     hash_list.commit_mow_path_transactions({20: {1: new}}, replace=True)
 
     assert hash_list.current_mow_path == {20: {1: new}}
+
+
+def test_planned_commit_records_the_target_session() -> None:
+    """A preview is owned by the next mowing lifecycle."""
+    hash_list = HashList()
+    new = MowPath(transaction_id=20, current_frame=1, total_frame=1, result=0)
+
+    hash_list.commit_mow_path_transactions(
+        {20: {1: new}},
+        session_id=4,
+        replace=True,
+    )
+
+    assert hash_list.planned_mow_path_pending is True
+    assert hash_list.current_mow_path_session_id == 4
 
 
 def test_commit_mow_path_transactions_rejects_partial_state() -> None:
@@ -123,6 +141,62 @@ def test_commit_mow_path_transactions_rejects_partial_state() -> None:
         raise AssertionError("partial transaction was accepted")
 
     assert hash_list.current_mow_path == existing
+
+
+def test_commit_mow_path_transactions_replaces_a_different_session() -> None:
+    """Publishing a new session removes complete transactions from the old one."""
+    hash_list = HashList()
+    hash_list.current_mow_path = {10: {1: MowPath(transaction_id=10, current_frame=1, total_frame=1)}}
+    hash_list.current_mow_path_session_id = 1
+    hash_list.generated_mow_path_geojson = {"old": True}
+    hash_list.generated_mow_progress_geojson = {"old": True}
+    replacement = {20: {1: MowPath(transaction_id=20, current_frame=1, total_frame=1)}}
+
+    hash_list.commit_mow_path_transactions(replacement, session_id=2)
+
+    assert hash_list.current_mow_path == replacement
+    assert hash_list.current_mow_path_session_id == 2
+    assert hash_list.generated_mow_path_geojson == {}
+    assert hash_list.generated_mow_progress_geojson == {}
+    assert hash_list.planned_mow_path_pending is False
+
+
+def test_replanning_same_session_clears_derived_geometry() -> None:
+    """Replacing packets invalidates derived geometry within the same session."""
+    hash_list = HashList()
+    hash_list.current_mow_path = {10: {1: MowPath(transaction_id=10, current_frame=1, total_frame=1)}}
+    hash_list.current_mow_path_session_id = 2
+    hash_list.generated_mow_path_geojson = {"old": True}
+    hash_list.generated_mow_progress_geojson = {"old": True}
+    replacement = {20: {1: MowPath(transaction_id=20, current_frame=1, total_frame=1)}}
+
+    hash_list.commit_mow_path_transactions(replacement, session_id=2, replace=True)
+
+    assert hash_list.current_mow_path == replacement
+    assert hash_list.generated_mow_path_geojson == {}
+    assert hash_list.generated_mow_progress_geojson == {}
+
+
+def test_clear_mow_path_resets_session_bound_state() -> None:
+    """An explicit new-session clear resets route and progress state."""
+    hash_list = HashList()
+    hash_list.current_mow_path = {10: {1: MowPath(transaction_id=10, current_frame=1, total_frame=1)}}
+    hash_list.current_mow_path_session_id = 1
+    hash_list.generated_mow_path_geojson = {"route": True}
+    hash_list.generated_mow_progress_geojson = {"progress": True}
+    hash_list.root_hash_lists = [
+        RootHashList(sub_cmd=0),
+        RootHashList(sub_cmd=3),
+    ]
+
+    hash_list.clear_mow_path()
+
+    assert hash_list.current_mow_path == {}
+    assert hash_list.current_mow_path_session_id == 0
+    assert hash_list.planned_mow_path_pending is False
+    assert hash_list.generated_mow_path_geojson == {}
+    assert hash_list.generated_mow_progress_geojson == {}
+    assert [root.sub_cmd for root in hash_list.root_hash_lists] == [0]
 
 
 # ---------------------------------------------------------------------------
