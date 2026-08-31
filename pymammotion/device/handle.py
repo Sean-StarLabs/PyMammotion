@@ -302,11 +302,23 @@ class DeviceHandle:
         self._unbound_migrating: bool = False
         #: Monotonic timestamp of the last inbound frame carrying ``sys.toapp_report_data``.
         #: Distinct from ``_last_report_at``, which stamps *every* LubaMsg — a map frame or
-        #: a settings ack is not evidence that the report stream is alive.  Doubles as the
-        #: change token ``_wait_for_report_data`` compares against.
+        #: a settings ack is not evidence that the report stream is alive. Used only for
+        #: age checks; the generation below is the change token.
         self._last_report_data_at: float = 0.0
+        #: Incremented only after report telemetry is applied to device state.
+        self._report_data_generation = 0
         #: Signalled on each such frame so waiters don't have to poll the timestamp.
         self._report_data_event: asyncio.Event = asyncio.Event()
+        # Freshness callers share one queued refresh. The required generation
+        # distinguishes callers covered by its response from callers that
+        # arrived after that response and therefore need a follow-up poll.
+        self._report_refresh_deadline = 0.0
+        self._report_refresh_required_generation = 0
+        self._report_refresh_in_flight = False
+        self._report_refresh_retry_task: asyncio.Task[None] | None = None
+        # EventBus awaits subscribers inline. Track inbound dispatch tasks so a
+        # subscriber cannot deadlock the receive loop by awaiting another frame.
+        self._inbound_dispatch_tasks: set[asyncio.Task[object]] = set()
         # Wire up critical error propagation from queue
         self.queue.on_critical_error = self._on_critical_error
 
@@ -612,9 +624,9 @@ class DeviceHandle:
         # Stamp report-stream liveness separately from general inbound traffic: this is
         # what proves an RPT_START actually started the stream (see _wait_for_report_data)
         # and what the one-shot poll debounces against.
-        if (sys_msg := luba_msg.sys) is not None and sys_msg.toapp_report_data is not None:
-            self._last_report_data_at = self._last_report_at
-            self._report_data_event.set()
+        has_report_data = luba_msg.sys is not None and (
+            luba_msg.sys.toapp_report_data is not None or luba_msg.sys.report_info is not None
+        )
 
         if self._availability.mqtt_reported_offline and transport_type != TransportType.BLE:
             self.update_availability(transport_type, self._availability.mqtt, mqtt_reported_offline=False)
@@ -659,8 +671,19 @@ class DeviceHandle:
         # _diff now walks `raw`, so deep-field mutations (e.g.
         # report_data.dev.sys_status) correctly produce a non-empty `changed`.
         snapshot, changed = self.state_machine.apply(updated_device, self._availability)
+        if has_report_data:
+            self._last_report_data_at = time.monotonic()
+            self._report_data_generation += 1
+            self._report_data_event.set()
         if changed and not self._stopping:
-            await self._state_changed_bus.emit(snapshot)
+            dispatch_task = asyncio.current_task()
+            if dispatch_task is not None:
+                self._inbound_dispatch_tasks.add(dispatch_task)
+            try:
+                await self._state_changed_bus.emit(snapshot)
+            finally:
+                if dispatch_task is not None:
+                    self._inbound_dispatch_tasks.discard(dispatch_task)
 
         # 6. Emit map_updated when the area set HA renders changes:
         #   - toapp_all_hash_name: wholesale area-name list (post-2025 / non-Luba1).
@@ -1136,6 +1159,7 @@ class DeviceHandle:
             self._ble_polling_task,
             self._dynamics_line_task,
             self._ble_connect_task,
+            self._report_refresh_retry_task,
         ):
             if task is not None and not task.done():
                 task.cancel()
@@ -1146,6 +1170,7 @@ class DeviceHandle:
         self._ble_polling_task = None
         self._dynamics_line_task = None
         self._ble_connect_task = None
+        self._report_refresh_retry_task = None
         self._ble_stream_active = False
         await self.queue.stop()
         await self.broker.close()
@@ -1243,8 +1268,13 @@ class DeviceHandle:
         """
         return self._last_report_data_at
 
-    async def _wait_for_report_data(self, ack_timeout: float, *, since: float) -> bool:
-        """Return True once ``_last_report_data_at`` moves off *since*, within *ack_timeout*.
+    @property
+    def report_data_token(self) -> int:
+        """Generation of the latest report successfully applied to device state."""
+        return self._report_data_generation
+
+    async def _wait_for_report_data(self, ack_timeout: float, *, since: int) -> bool:
+        """Return True once an applied-report generation is newer than *since*.
 
         *since* must be read **before** the triggering command is sent, not after: over
         BLE, and on a device already streaming, the frame can land while the send is still
@@ -1264,12 +1294,14 @@ class DeviceHandle:
         * a frame that landed just *before* the send did not count, even though it proves
           the stream is alive just as well as one that lands just after.
 
-        Watching ``_last_report_data_at`` advance has none of those: it observes the same
+        Watching the applied-report generation advance has none of those: it observes the same
         evidence without consuming it, and any number of callers can wait at once.
         """
+        if since > self._report_data_generation:
+            return False
         deadline = time.monotonic() + ack_timeout
         while True:
-            if self._last_report_data_at != since:
+            if self._report_data_generation > since:
                 return True
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -1278,12 +1310,46 @@ class DeviceHandle:
             # Re-check after the clear: a frame that landed between the test above and the
             # clear would otherwise have had its set() erased and we'd wait the full window
             # for a frame that already arrived.
-            if self._last_report_data_at != since:
+            if self._report_data_generation > since:
                 return True
             try:
                 await asyncio.wait_for(self._report_data_event.wait(), timeout=remaining)
             except TimeoutError:
                 return False
+
+    async def wait_for_report_data(self, timeout: float, *, since: int) -> bool:
+        """Wait for device telemetry newer than *since*."""
+        return await self._wait_for_report_data(timeout, since=since)
+
+    async def ensure_fresh_report_data(
+        self,
+        *,
+        max_age_s: float = 5.0,
+        timeout: float = 10.0,
+    ) -> bool:
+        """Ensure the state model has recent device-reported telemetry."""
+        if self._last_report_data_at and time.monotonic() - self._last_report_data_at <= max_age_s:
+            return True
+
+        before = self._report_data_generation
+        if self._last_report_data_at and time.monotonic() - self._last_report_data_at <= max_age_s:
+            return True
+        if self._skips_activity_loops:
+            return False
+        # This path has already applied the caller's freshness threshold.  The
+        # ordinary 15-second snapshot debounce would otherwise suppress a poll
+        # for telemetry that is stale by the caller's stricter definition.
+        deadline = time.monotonic() + timeout
+        self._report_refresh_deadline = max(self._report_refresh_deadline, deadline)
+        self._report_refresh_required_generation = max(
+            self._report_refresh_required_generation,
+            before,
+        )
+        await self._enqueue_report_refresh()
+        if asyncio.current_task() in self._inbound_dispatch_tasks:
+            return False
+        remaining = deadline - time.monotonic()
+        return remaining > 0 and await self._wait_for_report_data(remaining, since=before)
 
     async def request_report_snapshot(self) -> None:
         """Fire a one-shot count=1 report — no-op while BLE continuous stream is active.
@@ -1364,6 +1430,8 @@ class DeviceHandle:
         cmd_bytes: bytes,
         transport_send: Callable[[bytes], Awaitable[None]],
         sync_fn: Callable[[], Awaitable[None]] | None = None,
+        *,
+        deadline: float | Callable[[], float] | None = None,
     ) -> bool:
         """Send a report-config command and wait for the device's report stream to tick.
 
@@ -1389,11 +1457,20 @@ class DeviceHandle:
         """
         nudge = self._force_sync if sync_fn is None else sync_fn
 
+        def _remaining(limit: float) -> float:
+            if deadline is None:
+                return limit
+            current_deadline = deadline() if callable(deadline) else deadline
+            return min(limit, max(0.0, current_deadline - time.monotonic()))
+
         for attempt in (1, 2):
+            if _remaining(_RPT_ACK_TIMEOUT) <= 0:
+                return False
             if attempt > 1:
                 try:
                     _logger.debug("RPT_START [%s]: no report yet — re-syncing before retry", self.device_name)
-                    await nudge()
+                    async with asyncio.timeout(_remaining(_RPT_ACK_TIMEOUT)):
+                        await nudge()
                 except Exception:  # noqa: BLE001
                     _logger.debug(
                         "RPT_START [%s]: retry-prefix sync failed",
@@ -1402,9 +1479,17 @@ class DeviceHandle:
                     )
             # Sample before the send — see _wait_for_report_data on why sampling after
             # would drop a frame that lands while transport_send is still awaiting.
-            before = self._last_report_data_at
-            await transport_send(cmd_bytes)
-            if await self._wait_for_report_data(_RPT_ACK_TIMEOUT, since=before):
+            before = self._report_data_generation
+            send_timeout = _remaining(_RPT_ACK_TIMEOUT)
+            if send_timeout <= 0:
+                return False
+            try:
+                async with asyncio.timeout(send_timeout):
+                    await transport_send(cmd_bytes)
+            except TimeoutError:
+                continue
+            wait_timeout = _remaining(_RPT_ACK_TIMEOUT)
+            if wait_timeout > 0 and await self._wait_for_report_data(wait_timeout, since=before):
                 return True
 
         _logger.debug(
@@ -1483,6 +1568,79 @@ class DeviceHandle:
             dedup_key="one_shot_report",
         )
 
+    async def _enqueue_report_refresh(self) -> None:
+        """Queue the shared stale-report refresh using dispatch-time transport state."""
+        if self._report_refresh_in_flight:
+            return
+        one_shot_cmd = self.commands.request_iot_sys(
+            rpt_act=RptAct.RPT_START,
+            rpt_info_type=_REPORT_CHANNELS,
+            timeout=10_000,
+            count=1,
+        )
+        stream_cmd = self.commands.request_iot_sys(
+            rpt_act=RptAct.RPT_START,
+            rpt_info_type=_REPORT_CHANNELS,
+            timeout=10_000,
+            period=1000,
+            no_change_period=4000,
+            count=0,
+        )
+
+        async def _send() -> None:
+            self._report_refresh_in_flight = True
+            try:
+                if self._report_refresh_deadline <= time.monotonic():
+                    return
+                ble = self._transports.get(TransportType.BLE)
+                if self._ble_stream_active and ble is not None and ble.is_connected:
+
+                    async def _ble_send(payload: bytes) -> None:
+                        await ble.send_heartbeat(payload, iot_id=self.iot_id)
+
+                    async def _ble_sync() -> None:
+                        await _ble_send(self.commands.send_todev_ble_sync(sync_type=3))
+
+                    if await self._send_rpt_start_verified(
+                        stream_cmd,
+                        _ble_send,
+                        _ble_sync,
+                        deadline=lambda: self._report_refresh_deadline,
+                    ):
+                        self._ble_stream_active = True
+                else:
+                    await self._send_rpt_start_verified(
+                        one_shot_cmd,
+                        self.send_raw,
+                        deadline=lambda: self._report_refresh_deadline,
+                    )
+            finally:
+                self._report_refresh_in_flight = False
+                if (
+                    self._report_data_generation <= self._report_refresh_required_generation
+                    and self._report_refresh_deadline > time.monotonic()
+                ):
+                    # Schedule the follow-up on the next loop turn so this
+                    # callback has fully released its in-flight ownership.
+                    asyncio.get_running_loop().call_soon(self._schedule_report_refresh_retry)
+                else:
+                    self._report_refresh_deadline = 0.0
+                    self._report_refresh_required_generation = self._report_data_generation
+
+        await self.queue.enqueue(
+            _send,
+            priority=Priority.BACKGROUND,
+            dedup_key="report_refresh",
+        )
+
+    def _schedule_report_refresh_retry(self) -> None:
+        """Queue a follow-up for a freshness waiter that missed the prior response."""
+        if self._stopping:
+            return
+        if self._report_refresh_retry_task is not None and not self._report_refresh_retry_task.done():
+            return
+        self._report_refresh_retry_task = asyncio.create_task(self._enqueue_report_refresh())
+
     async def request_reports(self, count: int = 1, timeout: int = 10_000) -> None:
         """Enqueue a one-shot "request_iot_sys(count=count)" data refresh."""
         cmd_bytes = self.commands.request_iot_sys(
@@ -1547,7 +1705,11 @@ class DeviceHandle:
             except TransportError:
                 _logger.debug("ble_polling [%s]: stream command send failed", self.device_name, exc_info=True)
 
-        await self.queue.enqueue(_send, priority=Priority.BACKGROUND, skip_if_saga_active=True)
+        await self.queue.enqueue(
+            _send,
+            priority=Priority.BACKGROUND,
+            skip_if_saga_active=True,
+        )
 
     # ------------------------------------------------------------------
     # Public transport API (replaces private _transports access from HA)
