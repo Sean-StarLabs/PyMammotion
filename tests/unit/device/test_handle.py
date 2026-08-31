@@ -10,12 +10,19 @@ import pytest
 
 from pymammotion.aliyun.exceptions import DeviceOfflineException, DeviceUnboundException
 from pymammotion.data.model.device import MowerDevice
-from pymammotion.data.model.hash_list import HashList, MowPath, NavGetHashListData, RootHashList
+from pymammotion.data.model.hash_list import (
+    CommDataCouple,
+    HashList,
+    MowPath,
+    NavGetHashListData,
+    RootHashList,
+)
 from pymammotion.device.handle import DeviceHandle, DeviceRegistry
 from pymammotion.messaging.mow_path_saga import MowPathSaga
 from pymammotion.proto import LubaMsg as RealLubaMsg
 from pymammotion.state.device_state import DeviceAvailability, DeviceConnectionState, TransportAvailability
 from pymammotion.transport.base import NoTransportAvailableError, TransportType
+from pymammotion.utility.constant import WorkMode
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +296,42 @@ async def test_restored_route_is_trusted_after_observed_inactive_report() -> Non
     await handle.on_raw_message(bytes(report))
 
     assert handle.restored_mow_path_verification_session_id is None
+
+
+async def test_commit_dynamics_line_publishes_only_for_active_session() -> None:
+    """A stale in-flight trail is discarded without mutating current geometry."""
+    device = MowerDevice(name="Luba-Route", mow_session_id=3)
+    device.report_data.dev.sys_status = WorkMode.MODE_WORKING
+    handle = DeviceHandle(device_id="dev-route", device_name=device.name, initial_device=device)
+    points = [CommDataCouple(x=1, y=2)]
+
+    accepted = await handle.commit_dynamics_line(points, 3)
+
+    assert accepted is True
+    assert handle.snapshot.raw.map.dynamics_line == points
+    assert handle.snapshot.raw.map.dynamics_line_session_id == 3
+
+    handle.snapshot.raw.mow_session_id = 4
+    accepted = await handle.commit_dynamics_line([CommDataCouple(x=3, y=4)], 3)
+
+    assert accepted is False
+    assert handle.snapshot.raw.map.dynamics_line == points
+    assert handle.snapshot.raw.map.dynamics_line_session_id == 3
+
+
+async def test_commit_dynamics_line_keeps_nonempty_trail_on_empty_poll() -> None:
+    """An empty response cannot erase a retained trail in the same session."""
+    device = MowerDevice(name="Luba-Route", mow_session_id=3)
+    device.report_data.dev.sys_status = WorkMode.MODE_WORKING
+    device.map.dynamics_line = [CommDataCouple(x=1, y=2)]
+    device.map.dynamics_line_session_id = 3
+    handle = DeviceHandle(device_id="dev-route", device_name=device.name, initial_device=device)
+
+    accepted = await handle.commit_dynamics_line([], 3)
+
+    assert accepted is True
+    assert handle.snapshot.raw.map.dynamics_line == [CommDataCouple(x=1, y=2)]
+    assert handle.snapshot.raw.map.dynamics_line_session_id == 3
 
 
 def test_mow_path_fallback_transaction_ids_are_unique_across_sagas() -> None:

@@ -9,12 +9,13 @@ be distinct instances so mutations through one do not leak to the other.
 from __future__ import annotations
 
 from pymammotion.data.model.device import MowerDevice
-from pymammotion.data.model.hash_list import AreaHashNameList, MowPath
+from pymammotion.data.model.hash_list import AreaHashNameList, CommDataCouple, MowPath, PathType
 from pymammotion.device.state_reducer import MowerStateReducer
 from pymammotion.proto import (
     LubaMsg,
     MctlNav,
     CoverPathUploadT,
+    NavGetCommDataAck,
     NavGetAllPlanTask,
     NavGetHashListAck,
     NavReqCoverPath,
@@ -57,6 +58,29 @@ def test_nav_sys_param_cmd_only_copies_mower_state() -> None:
     _assert_sharing(current, updated, copied_fields=("mower_state",))
     assert updated.mower_state.rain_detection is True
     assert current.mower_state.rain_detection is False
+
+
+def test_dynamics_frames_always_remain_private_to_atomic_saga() -> None:
+    """Type-18 frames publish only after the saga assembles the full route."""
+    reducer = MowerStateReducer()
+    current = _make_device()
+    current.map.dynamics_line = [CommDataCouple(x=1, y=2)]
+    current.map.dynamics_line_session_id = 3
+    msg = LubaMsg(
+        nav=MctlNav(
+            toapp_get_commondata_ack=NavGetCommDataAck(
+                action=8,
+                type=PathType.DYNAMICS_LINE,
+                total_frame=2,
+                current_frame=1,
+            )
+        )
+    )
+
+    updated = reducer.apply(current, msg)
+
+    assert updated.map.dynamics_line == current.map.dynamics_line
+    assert updated.map.dynamics_line_session_id == 3
 
 
 def test_unable_time_set_only_copies_non_work_hours() -> None:
