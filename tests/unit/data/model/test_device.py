@@ -5,7 +5,14 @@ from __future__ import annotations
 import json
 
 from pymammotion.data.model.device import MowingDevice
-from pymammotion.data.model.hash_list import FrameList, HashList, MowPath, MowPathPacket, NavGetCommData
+from pymammotion.data.model.hash_list import (
+    CommDataCouple,
+    FrameList,
+    HashList,
+    MowPath,
+    MowPathPacket,
+    NavGetCommData,
+)
 from pymammotion.data.model.report_info import WorkData
 from pymammotion.proto import ReportInfoData, RptDevStatus, RptWork
 from pymammotion.utility.constant import WorkMode
@@ -155,6 +162,146 @@ def test_breakpoint_change_preserves_task_route() -> None:
 
     assert device.map.current_mow_path
     assert device.map.current_mow_path_hash == 123
+
+
+def test_new_task_clears_previous_dynamics_line() -> None:
+    """A direct task transition removes live geometry owned by the old task."""
+    device = MowingDevice(name="Yuka-Test")
+    device.map.dynamics_line = [CommDataCouple(x=1, y=2)]
+    device.map.dynamics_line_path_hash = 123
+    device.report_data.work = WorkData(path_hash=123)
+
+    device.update_report_data(
+        ReportInfoData(
+            dev=RptDevStatus(sys_status=WorkMode.MODE_WORKING),
+            work=RptWork(path_hash=456),
+        )
+    )
+
+    assert device.map.dynamics_line == []
+    assert device.map.dynamics_line_path_hash == 0
+
+
+def test_active_transient_task_sentinel_preserves_dynamics_line() -> None:
+    """An active report with no stable task hash does not erase current geometry."""
+    device = MowingDevice(name="Yuka-Test")
+    device.map.dynamics_line = [CommDataCouple(x=1, y=2)]
+    device.map.dynamics_line_path_hash = 123
+
+    device.update_report_data(
+        ReportInfoData(
+            dev=RptDevStatus(sys_status=WorkMode.MODE_WORKING),
+            work=RptWork(path_hash=1, ub_path_hash=456),
+        )
+    )
+
+    assert device.map.dynamics_line
+    assert device.map.dynamics_line_path_hash == 123
+
+
+def test_inactive_task_end_sentinel_clears_dynamics_line() -> None:
+    """A confirmed inactive end report clears geometry for the finished task."""
+    device = MowingDevice(name="Yuka-Test")
+    device.map.dynamics_line = [CommDataCouple(x=1, y=2)]
+    device.map.dynamics_line_path_hash = 123
+
+    device.update_report_data(
+        ReportInfoData(
+            dev=RptDevStatus(sys_status=WorkMode.MODE_READY),
+            work=RptWork(path_hash=1),
+        )
+    )
+
+    assert device.map.dynamics_line == []
+    assert device.map.dynamics_line_path_hash == 0
+
+
+def test_partial_work_report_uses_previous_active_status() -> None:
+    """A work-only progress report cannot look like a confirmed task end."""
+    device = MowingDevice(name="Yuka-Test")
+    device.report_data.dev.sys_status = WorkMode.MODE_WORKING
+    device.report_data.work = WorkData(path_hash=123)
+    device.map.dynamics_line = [CommDataCouple(x=1, y=2)]
+    device.map.dynamics_line_path_hash = 123
+
+    device.update_report_data(ReportInfoData(work=RptWork()))
+
+    assert device.map.dynamics_line
+    assert device.map.dynamics_line_path_hash == 123
+    assert device.report_data.work.path_hash == 123
+
+
+def test_dev_only_task_end_clears_dynamics_line() -> None:
+    """A confirmed inactive status ends live geometry without a work payload."""
+    device = MowingDevice(name="Yuka-Test")
+    device.report_data.dev.sys_status = WorkMode.MODE_WORKING
+    device.report_data.work = WorkData(path_hash=123)
+    device.map.dynamics_line = [CommDataCouple(x=1, y=2)]
+    device.map.dynamics_line_path_hash = 123
+
+    device.update_report_data(ReportInfoData(dev=RptDevStatus(sys_status=WorkMode.MODE_READY)))
+
+    assert device.map.dynamics_line == []
+    assert device.map.dynamics_line_path_hash == 0
+
+
+def test_battery_only_dev_report_preserves_active_dynamics_line() -> None:
+    """A default scalar status in partial telemetry is not a task end."""
+    device = MowingDevice(name="Yuka-Test")
+    device.report_data.dev.sys_status = WorkMode.MODE_WORKING
+    device.report_data.work = WorkData(path_hash=123)
+    device.map.dynamics_line = [CommDataCouple(x=1, y=2)]
+    device.map.dynamics_line_path_hash = 123
+
+    device.update_report_data(ReportInfoData(dev=RptDevStatus(battery_val=42)))
+
+    assert device.map.dynamics_line
+    assert device.map.dynamics_line_path_hash == 123
+
+
+def test_combined_partial_report_preserves_active_task_geometry() -> None:
+    """Default dev status plus a work sentinel cannot end an active task."""
+    device = MowingDevice(name="Yuka-Test")
+    device.report_data.dev.sys_status = WorkMode.MODE_WORKING
+    device.report_data.work = WorkData(path_hash=123)
+    device.map = _make_hash_list_with_int_keys()
+    device.map.current_mow_path_hash = 123
+    device.map.dynamics_line = [CommDataCouple(x=1, y=2)]
+    device.map.dynamics_line_path_hash = 123
+
+    device.update_report_data(
+        ReportInfoData(
+            dev=RptDevStatus(battery_val=42),
+            work=RptWork(path_hash=1),
+        )
+    )
+
+    assert device.report_data.work.path_hash == 123
+    assert device.map.current_mow_path
+    assert device.map.current_mow_path_hash == 123
+    assert device.map.dynamics_line
+    assert device.map.dynamics_line_path_hash == 123
+
+
+def test_new_active_sentinel_does_not_restore_ended_task_hash() -> None:
+    """A task confirmed ended cannot be rebound to a later active sentinel."""
+    device = MowingDevice(name="Yuka-Test")
+    device.report_data.dev.sys_status = WorkMode.MODE_WORKING
+    device.report_data.work = WorkData(path_hash=123)
+    device.map.dynamics_line = [CommDataCouple(x=1, y=2)]
+    device.map.dynamics_line_path_hash = 123
+
+    device.update_report_data(ReportInfoData(dev=RptDevStatus(sys_status=WorkMode.MODE_READY)))
+    device.update_report_data(
+        ReportInfoData(
+            dev=RptDevStatus(sys_status=WorkMode.MODE_WORKING),
+            work=RptWork(path_hash=1),
+        )
+    )
+
+    assert device.report_data.work.path_hash == 1
+    assert device.map.dynamics_line == []
+    assert device.map.dynamics_line_path_hash == 0
 
 
 def test_active_report_preserves_current_job_path() -> None:

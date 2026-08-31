@@ -29,6 +29,7 @@ from pymammotion.data.model.hash_list import (
     CommDataCouple,
     NavGetCommData,
     NavGetHashListData,
+    PathType,
     Plan,
     SvgMessage,
 )
@@ -185,9 +186,12 @@ class MowerStateReducer(StateReducer):
                 # message was a ~150 MiB/h leak (#125).
                 nav_msg_name = betterproto2.which_one_of(message.nav, "SubNavMsg")[0]  # type: ignore
                 match nav_msg_name:
+                    case "toapp_get_commondata_ack":
+                        common_data = message.nav.toapp_get_commondata_ack  # type: ignore
+                        if common_data.type != PathType.DYNAMICS_LINE:
+                            device.map = copy.deepcopy(current.map)
                     case (
                         "toapp_gethash_ack"
-                        | "toapp_get_commondata_ack"
                         | "todev_planjob_set"
                         | "all_plan_task"
                         | "toapp_svg_msg"
@@ -373,6 +377,8 @@ class MowerStateReducer(StateReducer):
                 )
             case "toapp_get_commondata_ack":
                 common_data: NavGetCommDataAck = nav_msg[1]  # type: ignore
+                if common_data.type == PathType.DYNAMICS_LINE:
+                    return
                 device.map.update(NavGetCommData.from_dict(common_data.to_dict(casing=betterproto2.Casing.SNAKE)))
                 # Skip eager geojson regen during sagas — the saga's on_complete
                 # handler regenerates once after all frames arrive instead of

@@ -429,6 +429,8 @@ class HashList(DataClassORJSONMixin):
     (x, y) pairs in device-local coordinates.  Replaced wholesale on each
     successful fetch; empty when no session is active.
     """
+    dynamics_line_path_hash: int = 0
+    """Device-reported task hash associated with ``dynamics_line``."""
     generated_dynamics_line_geojson: dict[str, Any] = field(default_factory=dict)
     """WGS-84 LineString of ``dynamics_line``, regenerated after each fetch."""
     generated_mow_progress_geojson: dict[str, Any] = field(default_factory=dict)
@@ -842,13 +844,10 @@ class HashList(DataClassORJSONMixin):
             self.update_hash_lists(self.hashlist)
             return result
 
-        # DYNAMICS_LINE is normally assembled by CommonDataSaga and stored via
-        # update_dynamics_line; handle direct arrivals defensively here.
+        # Dynamics lines are transactionally assembled and task-bound by
+        # DynamicsLineSaga. Direct or delayed frames cannot publish partial data.
         if hash_data.type == PathType.DYNAMICS_LINE:
-            if hash_data.current_frame == 1:
-                self.dynamics_line = []
-            self.dynamics_line.extend(hash_data.data_couple)
-            return True
+            return False
 
         # NavGetCommData with type=SVG carries no geometry — real SVG geometry only
         # arrives as SvgMessage (toapp_svg_msg).  Discard rather than storing it as a
@@ -868,12 +867,19 @@ class HashList(DataClassORJSONMixin):
         bucket = self.unknown_type_frames.setdefault(hash_data.type, {})
         return self._add_hash_data(bucket, hash_data)
 
-    def update_dynamics_line(self, points: list[CommDataCouple]) -> None:
+    def update_dynamics_line(self, points: list[CommDataCouple], path_hash: int) -> None:
         """Replace ``dynamics_line`` with *points*.
 
         The device always returns the full current-session path, not a delta.
         """
         self.dynamics_line = points
+        self.dynamics_line_path_hash = path_hash
+
+    def clear_dynamics_line(self) -> None:
+        """Clear task-bound live route geometry."""
+        self.dynamics_line = []
+        self.dynamics_line_path_hash = 0
+        self.generated_dynamics_line_geojson = {}
 
     def find_missing_mow_path_frames(self) -> dict[int, list[int]]:
         """Return ``{transaction_id: [missing_frame, …]}`` for incomplete transactions only."""
@@ -1106,6 +1112,7 @@ class HashList(DataClassORJSONMixin):
             self.generated_mow_path_geojson = {}
             self.generated_mow_progress_geojson = {}
             self.last_ub_path_hash = 0
+            self.clear_dynamics_line()
 
     def has_mow_path_for_hash(self, path_hash: int) -> bool:
         """Return True if cover-path data for *path_hash* is already cached.
@@ -1243,11 +1250,13 @@ class HashList(DataClassORJSONMixin):
     def apply_dynamics_line_geojson(self, rtk: LocationPoint) -> None:
         """Convert ``dynamics_line`` to a WGS-84 LineString GeoJSON.
 
-        No-op when RTK isn't fixed or fewer than two points have been received.
+        Clears derived geometry when RTK isn't fixed or fewer than two points
+        have been received.
         """
         from pymammotion.data.model.generate_geojson import GeojsonGenerator
 
         if rtk.latitude == 0.0 or len(self.dynamics_line) < 2:
+            self.generated_dynamics_line_geojson = {}
             return
 
         conv = CoordinateConverter(rtk.latitude, rtk.longitude)

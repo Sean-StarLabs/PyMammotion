@@ -363,13 +363,19 @@ class MowerDevice(Device):
         if toapp_report_data.fw_info:
             self.update_device_firmwares(toapp_report_data.fw_info)
 
-        if toapp_report_data.work:
+        previous_path_hash = int(self.report_data.work.path_hash)
+        was_actively_mowing = self.report_data.dev.sys_status in MOWING_ACTIVE_MODES
+        incoming_status = toapp_report_data.dev.sys_status if toapp_report_data.dev else 0
+        reported_status = incoming_status or self.report_data.dev.sys_status
+        is_actively_mowing = reported_status in MOWING_ACTIVE_MODES
+        if toapp_report_data.dev is not None and reported_status != 0 and not is_actively_mowing:
+            self.map.clear_dynamics_line()
+
+        if toapp_report_data.work is not None:
             # A mid-mow restart can produce path_hash=0/1 or ub_path_hash=0 in
             # the first report before the device re-reports its active hashes.
             # Guard all state-clearing operations so a transient zero doesn't
             # wipe live mow data (cover path, zone list, GeoJSON) mid-job.
-            sys_status = toapp_report_data.dev.sys_status if toapp_report_data.dev else 0
-            is_actively_mowing = sys_status in MOWING_ACTIVE_MODES
             reported_path_hash = int(toapp_report_data.work.path_hash)
             if reported_path_hash in (0, 1):
                 reported_path_hash = 0
@@ -392,6 +398,9 @@ class MowerDevice(Device):
                         self.map.current_mow_path_hash = reported_path_hash
                     else:
                         self.map.invalidate_mow_path(0)
+            if self.map.dynamics_line and reported_path_hash:
+                if self.map.dynamics_line_path_hash != reported_path_hash:
+                    self.map.clear_dynamics_line()
             if not is_actively_mowing:
                 if (toapp_report_data.work.area >> 16) == 0 and toapp_report_data.work.ub_path_hash == 0:
                     self.work.zone_hashs = []
@@ -403,6 +412,17 @@ class MowerDevice(Device):
             self.map.invalidate_breakpoint_line(toapp_report_data.work.ub_path_hash)
 
         self.report_data.update(toapp_report_data)
+        if (
+            toapp_report_data.work is not None
+            and was_actively_mowing
+            and is_actively_mowing
+            and self.report_data.work.path_hash in (0, 1)
+            and previous_path_hash not in (0, 1)
+        ):
+            # Active devices transiently report the end sentinels while
+            # reconnecting. Keep the last stable task identity so subsequent
+            # live-line polls remain bound to the running job.
+            self.report_data.work.path_hash = previous_path_hash
 
     def run_state_update(self, tard_state: SystemTardStateTunnelMsg) -> None:
         """Set lat long, work zone of RTK and robot."""

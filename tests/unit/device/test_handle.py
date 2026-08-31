@@ -10,7 +10,7 @@ import pytest
 
 from pymammotion.aliyun.exceptions import DeviceOfflineException, DeviceUnboundException
 from pymammotion.data.model.device import MowerDevice
-from pymammotion.data.model.hash_list import HashList, MowPath
+from pymammotion.data.model.hash_list import CommDataCouple, HashList, MowPath
 from pymammotion.device.handle import DeviceHandle, DeviceRegistry
 from pymammotion.messaging.mow_path_saga import MowPathSaga
 from pymammotion.proto import LubaMsg as RealLubaMsg
@@ -164,6 +164,27 @@ async def test_commit_mow_path_transactions_rejects_changed_route() -> None:
 
     assert committed is False
     assert handle.snapshot.raw.map.current_mow_path == {}
+
+
+async def test_commit_dynamics_line_publishes_only_for_active_task() -> None:
+    """A stale in-flight route is discarded without mutating current geometry."""
+    device = MowerDevice(name="Luba-Route")
+    device.report_data.work.path_hash = 123
+    handle = DeviceHandle(device_id="dev-route", device_name=device.name, initial_device=device)
+    points = [CommDataCouple(x=1, y=2)]
+
+    accepted = await handle.commit_dynamics_line(points, 123)
+
+    assert accepted is True
+    assert handle.snapshot.raw.map.dynamics_line == points
+    assert handle.snapshot.raw.map.dynamics_line_path_hash == 123
+
+    handle.snapshot.raw.report_data.work.path_hash = 456
+    accepted = await handle.commit_dynamics_line([CommDataCouple(x=3, y=4)], 123)
+
+    assert accepted is False
+    assert handle.snapshot.raw.map.dynamics_line == points
+    assert handle.snapshot.raw.map.dynamics_line_path_hash == 123
 
 
 def test_mow_path_fallback_transaction_ids_are_unique_across_sagas() -> None:

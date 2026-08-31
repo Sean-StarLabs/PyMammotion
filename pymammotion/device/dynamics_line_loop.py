@@ -30,9 +30,8 @@ import logging
 from typing import TYPE_CHECKING
 
 from pymammotion.data.model.device import MowerDevice
-from pymammotion.data.model.hash_list import PathType
 from pymammotion.device.modes import _DeviceMode
-from pymammotion.messaging.common_data_saga import CommonDataSaga
+from pymammotion.messaging.dynamics_line_saga import DynamicsLineSaga
 from pymammotion.transport.base import TransportType
 from pymammotion.utility.device_type import DeviceType
 
@@ -113,21 +112,21 @@ async def _enqueue_dynamics_line_saga(handle: DeviceHandle) -> None:
     ``device.map.dynamics_line`` and the WGS-84 geojson is regenerated using
     the current RTK location, mirroring ``MammotionClient.get_dynamics_line``.
     """
-    saga = CommonDataSaga(
+
+    def _task_path_hash() -> int:
+        raw = handle.snapshot.raw
+        return raw.report_data.work.task_path_hash if isinstance(raw, MowerDevice) else 0
+
+    saga = DynamicsLineSaga(
         command_builder=handle.commands,
         send_command=handle.send_raw,
-        action=8,
-        type=PathType.DYNAMICS_LINE,
+        get_task_path_hash=_task_path_hash,
     )
 
     async def _on_complete() -> None:
-        if not saga.result:
+        if not saga.transfer_complete:
             return
-        raw = handle.snapshot.raw
-        if not isinstance(raw, MowerDevice):
-            return
-        raw.map.update_dynamics_line(saga.result)
-        raw.map.apply_dynamics_line_geojson(raw.location.RTK)
+        await handle.commit_dynamics_line(saga.result, saga.task_path_hash)
 
     try:
         await handle.enqueue_saga(saga, on_complete=_on_complete)
