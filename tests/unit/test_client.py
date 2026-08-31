@@ -8,6 +8,7 @@ import pytest
 
 from pymammotion.account.registry import AccountSession
 from pymammotion.client import MammotionClient
+from pymammotion.data.model.hash_list import RootHashList
 from pymammotion.device.handle import DeviceHandle, DeviceRegistry
 from pymammotion.http.http import MammotionHTTP
 from pymammotion.http.model.http import (
@@ -296,6 +297,16 @@ async def _make_handle_with_transport(device_id: str, device_name: str) -> Devic
     return handle
 
 
+async def _make_mower_handle_with_transport(device_id: str, device_name: str) -> DeviceHandle:
+    """Return a started handle backed by the concrete mower state model."""
+    from pymammotion.data.model.device import MowerDevice  # noqa: PLC0415
+
+    handle = DeviceHandle(device_id=device_id, device_name=device_name, initial_device=MowerDevice(name=device_name))
+    await handle.add_transport(_make_mock_transport())
+    await handle.start()
+    return handle
+
+
 async def test_start_map_sync_generates_geojson_on_completion() -> None:
     """start_map_sync must call device.map.generate_geojson after the MapFetchSaga succeeds."""
     client = MammotionClient()
@@ -320,26 +331,31 @@ async def test_start_map_sync_generates_geojson_on_completion() -> None:
     await handle.stop()
 
 
-async def test_start_mow_path_saga_generates_geojson_on_completion() -> None:
-    """start_mow_path_saga must call device.map.generate_mowing_geojson after the saga succeeds."""
+async def test_start_mow_path_saga_commits_result_on_completion() -> None:
+    """A completed saga publishes its result through the device handle."""
     client = MammotionClient()
     handle = await _make_handle_with_transport("dev1", "Luba-Mow")
     await client._device_registry.register(handle)
 
-    mock_device = _make_device_with_rtk(lat=0.5, lon=0.5)
-    client.get_device_by_name = MagicMock(return_value=mock_device)  # type: ignore[method-assign]
+    handle.commit_mow_path_transactions = AsyncMock()  # type: ignore[method-assign]
 
     with patch("pymammotion.client.MowPathSaga") as MockSaga:
         mock_saga_instance = MagicMock()
         mock_saga_instance.name = "mow_path_fetch"
         mock_saga_instance.max_attempts = 1
         mock_saga_instance.execute = AsyncMock()
+        mock_saga_instance.result = {}
+        mock_saga_instance.result_root_hash_list = RootHashList(sub_cmd=3)
         MockSaga.return_value = mock_saga_instance
 
         await client.start_mow_path_saga("Luba-Mow", zone_hashs=[1, 2])
         await asyncio.sleep(0.15)
 
-    mock_device.map.generate_mowing_geojson.assert_called_once()
+    handle.commit_mow_path_transactions.assert_awaited_once_with(
+        {},
+        replace=True,
+        line_hash_list=mock_saga_instance.result_root_hash_list,
+    )
     await handle.stop()
 
 

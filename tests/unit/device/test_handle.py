@@ -9,7 +9,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from pymammotion.aliyun.exceptions import DeviceOfflineException, DeviceUnboundException
+from pymammotion.data.model.device import MowerDevice
+from pymammotion.data.model.hash_list import HashList, MowPath, NavGetHashListData, RootHashList
 from pymammotion.device.handle import DeviceHandle, DeviceRegistry
+from pymammotion.messaging.mow_path_saga import MowPathSaga
 from pymammotion.proto import LubaMsg as RealLubaMsg
 from pymammotion.state.device_state import DeviceAvailability, DeviceConnectionState, TransportAvailability
 from pymammotion.transport.base import NoTransportAvailableError, TransportType
@@ -114,6 +117,76 @@ async def test_stop_cancels_queue_and_broker() -> None:
 
     queue_stop.assert_awaited_once()
     broker_close.assert_awaited_once()
+
+
+def test_route_transaction_ids_remain_unique_with_frozen_time() -> None:
+    """Back-to-back path batches cannot reuse the same millisecond identifier."""
+    handle = make_handle()
+
+    with patch("pymammotion.device.handle.time.time", return_value=1234.5):
+        first = handle.next_route_transaction_id()
+        second = handle.next_route_transaction_id()
+
+    assert second == first + 1
+
+
+async def test_commit_mow_path_transactions_publishes_new_snapshot() -> None:
+    """A completed route is emitted without mutating retained snapshots."""
+    handle = DeviceHandle(
+        device_id="dev-route",
+        device_name="Luba-Route",
+        initial_device=MowerDevice(name="Luba-Route"),
+    )
+    retained = handle.snapshot
+    emitted: list[object] = []
+
+    async def record(snapshot: object) -> None:
+        emitted.append(snapshot)
+
+    handle.subscribe_state_changed(record)
+    transactions = {20: {1: MowPath(transaction_id=20, current_frame=1, total_frame=1)}}
+
+    await handle.commit_mow_path_transactions(transactions)
+
+    assert retained.raw.map.current_mow_path == {}
+    assert handle.snapshot.raw.map.current_mow_path == transactions
+    assert emitted
+
+
+async def test_commit_mow_path_transactions_publishes_staged_manifest() -> None:
+    """The complete line manifest and cover paths become visible together."""
+    handle = DeviceHandle(
+        device_id="dev-route",
+        device_name="Luba-Route",
+        initial_device=MowerDevice(name="Luba-Route"),
+    )
+    manifest = RootHashList(
+        total_frame=1,
+        sub_cmd=3,
+        data=[NavGetHashListData(sub_cmd=3, total_frame=1, current_frame=1, data_couple=[123])],
+    )
+    transactions = {20: {1: MowPath(transaction_id=20, current_frame=1, total_frame=1)}}
+
+    await handle.commit_mow_path_transactions(transactions, line_hash_list=manifest)
+
+    assert handle.snapshot.raw.map.root_hash_lists == [manifest]
+    assert handle.snapshot.raw.map.current_mow_path == transactions
+
+
+def test_mow_path_fallback_transaction_ids_are_unique_across_sagas() -> None:
+    """Standalone sagas retain timestamp semantics without reusing an ID."""
+    kwargs = {
+        "command_builder": MagicMock(),
+        "send_command": AsyncMock(),
+        "get_map": HashList,
+        "zone_hashs": [1],
+    }
+
+    with patch("pymammotion.messaging.mow_path_saga.time.time", return_value=1234.5):
+        first = MowPathSaga(**kwargs)._new_transaction_id()  # noqa: SLF001
+        second = MowPathSaga(**kwargs)._new_transaction_id()  # noqa: SLF001
+
+    assert second == first + 1
 
 
 # ---------------------------------------------------------------------------
