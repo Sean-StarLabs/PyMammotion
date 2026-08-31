@@ -6,6 +6,7 @@ import json
 
 from pymammotion.data.model.device import MowingDevice
 from pymammotion.data.model.hash_list import (
+    CommDataCouple,
     FrameList,
     HashList,
     MowPath,
@@ -66,6 +67,8 @@ def test_new_mow_session_clears_route_from_the_previous_session() -> None:
     device = MowingDevice(name="Yuka-Test", mow_session_id=4)
     device.map = _make_hash_list_with_int_keys()
     device.map.current_mow_path_session_id = 4
+    device.map.dynamics_line = [CommDataCouple(x=1, y=2)]
+    device.map.dynamics_line_session_id = 4
     device.report_data.dev.sys_status = WorkMode.MODE_READY
 
     device.update_report_data(
@@ -77,6 +80,7 @@ def test_new_mow_session_clears_route_from_the_previous_session() -> None:
 
     assert device.mow_session_id == 5
     assert device.map.current_mow_path == {}
+    assert device.map.dynamics_line == []
 
 
 def test_new_mow_session_clears_manifest_without_cached_route() -> None:
@@ -101,6 +105,8 @@ def test_planned_route_is_adopted_by_the_next_mow_session() -> None:
     device = MowingDevice(name="Yuka-Test", mow_session_id=4)
     device.map = _make_hash_list_with_int_keys()
     device.map.current_mow_path_session_id = 5
+    device.map.dynamics_line = [CommDataCouple(x=1, y=2)]
+    device.map.dynamics_line_session_id = 5
     device.map.planned_mow_path_pending = True
     device.map.root_hash_lists = [RootHashList(sub_cmd=3)]
     device.report_data.dev.sys_status = WorkMode.MODE_READY
@@ -114,6 +120,7 @@ def test_planned_route_is_adopted_by_the_next_mow_session() -> None:
 
     assert device.mow_session_id == 5
     assert device.map.current_mow_path
+    assert device.map.dynamics_line
     assert device.map.current_mow_path_session_id == 5
     assert device.map.planned_mow_path_pending is False
     assert [root.sub_cmd for root in device.map.root_hash_lists] == [3]
@@ -124,6 +131,8 @@ def test_path_hash_rotation_does_not_change_session_or_clear_route() -> None:
     device = MowingDevice(name="Yuka-Test", mow_session_id=5)
     device.map = _make_hash_list_with_int_keys()
     device.map.current_mow_path_session_id = 5
+    device.map.dynamics_line = [CommDataCouple(x=1, y=2)]
+    device.map.dynamics_line_session_id = 5
     device.report_data.dev.sys_status = WorkMode.MODE_WORKING
     device.report_data.work = WorkData(path_hash=123, ub_path_hash=456)
 
@@ -136,6 +145,7 @@ def test_path_hash_rotation_does_not_change_session_or_clear_route() -> None:
 
     assert device.mow_session_id == 5
     assert device.map.current_mow_path
+    assert device.map.dynamics_line
 
 
 def test_pause_return_and_charging_pause_remain_in_same_session() -> None:
@@ -143,6 +153,8 @@ def test_pause_return_and_charging_pause_remain_in_same_session() -> None:
     device = MowingDevice(name="Yuka-Test", mow_session_id=5)
     device.map = _make_hash_list_with_int_keys()
     device.map.current_mow_path_session_id = 5
+    device.map.dynamics_line = [CommDataCouple(x=1, y=2)]
+    device.map.dynamics_line_session_id = 5
     device.report_data.dev.sys_status = WorkMode.MODE_WORKING
 
     for mode in (
@@ -160,6 +172,7 @@ def test_pause_return_and_charging_pause_remain_in_same_session() -> None:
 
     assert device.mow_session_id == 5
     assert device.map.current_mow_path
+    assert device.map.dynamics_line
 
 
 def test_completed_route_is_retained_until_the_next_session() -> None:
@@ -167,6 +180,8 @@ def test_completed_route_is_retained_until_the_next_session() -> None:
     device = MowingDevice(name="Yuka-Test", mow_session_id=5)
     device.map = _make_hash_list_with_int_keys()
     device.map.current_mow_path_session_id = 5
+    device.map.dynamics_line = [CommDataCouple(x=1, y=2)]
+    device.map.dynamics_line_session_id = 5
     device.report_data.dev.sys_status = WorkMode.MODE_WORKING
 
     device.update_report_data(
@@ -178,6 +193,7 @@ def test_completed_route_is_retained_until_the_next_session() -> None:
 
     assert device.mow_session_id == 5
     assert device.map.current_mow_path
+    assert device.map.dynamics_line
 
 
 def test_returning_from_ready_does_not_create_a_mow_session() -> None:
@@ -185,6 +201,8 @@ def test_returning_from_ready_does_not_create_a_mow_session() -> None:
     device = MowingDevice(name="Yuka-Test", mow_session_id=5)
     device.map = _make_hash_list_with_int_keys()
     device.map.current_mow_path_session_id = 5
+    device.map.dynamics_line = [CommDataCouple(x=1, y=2)]
+    device.map.dynamics_line_session_id = 5
     device.report_data.dev.sys_status = WorkMode.MODE_READY
 
     device.update_report_data(
@@ -196,6 +214,7 @@ def test_returning_from_ready_does_not_create_a_mow_session() -> None:
 
     assert device.mow_session_id == 5
     assert device.map.current_mow_path
+    assert device.map.dynamics_line
 
 
 def test_active_job_bootstraps_session_identity_after_upgrade() -> None:

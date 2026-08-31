@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -25,7 +26,7 @@ from pymammotion.proto import (
     PlanJobSet,
     SpinoCtrl,
 )
-from pymammotion.transport.base import CommandTimeoutError
+from pymammotion.transport.base import CommandTimeoutError, SagaInterruptedError
 
 
 def _frame(current: int, total: int, *, type_code: int = 3) -> LubaMsg:
@@ -108,6 +109,26 @@ async def test_ack_stream_acks_duplicates_too() -> None:
 
     await ack_stream(queue, field="toapp_get_commondata_ack", ack=ack, timeout=0.1)
     assert acked == [1, 1, 2]
+
+
+@pytest.mark.parametrize("current,total", [(0, 2), (3, 2), (1, 0)])
+async def test_ack_stream_rejects_invalid_frame_numbers(current: int, total: int) -> None:
+    """Malformed indices cannot satisfy a transfer by inflating frame count."""
+    queue: asyncio.Queue = asyncio.Queue()
+    queue.put_nowait(_frame(current, total))
+
+    with pytest.raises(SagaInterruptedError):
+        await ack_stream(queue, field="toapp_get_commondata_ack", ack=AsyncMock(), timeout=0.1)
+
+
+async def test_ack_stream_rejects_changed_total_frame() -> None:
+    """Every frame in one transfer must describe the same frame set."""
+    queue: asyncio.Queue = asyncio.Queue()
+    queue.put_nowait(_frame(1, 2))
+    queue.put_nowait(_frame(2, 99))
+
+    with pytest.raises(SagaInterruptedError):
+        await ack_stream(queue, field="toapp_get_commondata_ack", ack=AsyncMock(), timeout=0.1)
 
 
 async def test_ack_stream_times_out_when_the_device_goes_quiet() -> None:

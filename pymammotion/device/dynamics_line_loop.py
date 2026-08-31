@@ -26,13 +26,13 @@ assembled point list is stored on ``device.map.dynamics_line``.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING
 
 from pymammotion.data.model.device import MowerDevice
-from pymammotion.data.model.hash_list import PathType
 from pymammotion.device.modes import _DeviceMode
-from pymammotion.messaging.common_data_saga import CommonDataSaga
+from pymammotion.messaging.dynamics_line_saga import DynamicsLineSaga
 from pymammotion.transport.base import TransportType
 from pymammotion.utility.device_type import DeviceType
 
@@ -63,9 +63,9 @@ async def dynamics_line_loop(handle: DeviceHandle) -> None:
     device_type = DeviceType.value_of_str(handle.device_name)
 
     while not handle._stopping:  # noqa: SLF001
-        if await handle.sleep_or_rearm(_DYNAMICS_LINE_POLL_INTERVAL):
-            # rearmed by a user command — re-evaluate immediately
-            pass
+        # The handle's shared rearm event is set after every saga. Using it here
+        # would make this saga wake itself and retry at the transfer timeout.
+        await asyncio.sleep(_DYNAMICS_LINE_POLL_INTERVAL)
 
         if handle._stopping:  # noqa: SLF001
             return
@@ -113,21 +113,21 @@ async def _enqueue_dynamics_line_saga(handle: DeviceHandle) -> None:
     ``device.map.dynamics_line`` and the WGS-84 geojson is regenerated using
     the current RTK location, mirroring ``MammotionClient.get_dynamics_line``.
     """
-    saga = CommonDataSaga(
+
+    def _mow_session_id() -> int:
+        raw = handle.snapshot.raw
+        return raw.mow_session_id if isinstance(raw, MowerDevice) else 0
+
+    saga = DynamicsLineSaga(
         command_builder=handle.commands,
         send_command=handle.send_raw,
-        action=8,
-        type=PathType.DYNAMICS_LINE,
+        get_mow_session_id=_mow_session_id,
     )
 
     async def _on_complete() -> None:
-        if not saga.result:
+        if not saga.transfer_complete:
             return
-        raw = handle.snapshot.raw
-        if not isinstance(raw, MowerDevice):
-            return
-        raw.map.update_dynamics_line(saga.result)
-        raw.map.apply_dynamics_line_geojson(raw.location.RTK)
+        await handle.commit_dynamics_line(saga.result, saga.mow_session_id)
 
     try:
         await handle.enqueue_saga(saga, on_complete=_on_complete)
