@@ -21,6 +21,10 @@ class DynamicsLineSaga(CommonDataSaga):
     """Fetch one complete dynamics line bound to the task active at execution."""
 
     name = "dynamics_line_fetch"
+    interruptible = True
+    # Type-18 responses have no request token. An immediate restore could consume
+    # frames from the cancelled transfer, so let the next poll start a fresh read.
+    restore_on_failed_preemption = False
     # Type-18 responses carry no request token. Let the regular 10-second poll
     # retry instead of issuing an immediate request that could consume a late
     # response from the timed-out transfer.

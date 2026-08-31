@@ -981,6 +981,10 @@ class DeviceHandle:
             await self.emit_state_changed(snapshot)
         return accepted
 
+    async def run_after_preempting_reads(self, work: Callable[[], Awaitable[None]]) -> None:
+        """Run a user command atomically after preempting read-only sagas."""
+        await self.queue.run_after_preempting_reads(work)
+
     def has_queued_commands(self) -> bool:
         """Return True if the queue has pending work or a saga is active."""
         return self.queue._queue.qsize() > 0 or self.queue.is_saga_active  # noqa: SLF001
@@ -1992,7 +1996,13 @@ class DeviceHandle:
                     exc_info=True,
                 )
 
-    async def send_raw(self, payload: bytes, *, prefer_ble: bool | None = None) -> None:
+    async def send_raw(
+        self,
+        payload: bytes,
+        *,
+        prefer_ble: bool | None = None,
+        raise_on_rate_limit: bool = False,
+    ) -> None:
         """Send raw bytes via the best available transport, with BLE fallback on offline."""
         _logger.debug(
             "send_raw '%s': %d bytes prefer_ble=%s transports=%s",
@@ -2039,9 +2049,13 @@ class DeviceHandle:
                 self.device_name,
                 transport.seconds_until_send_available(),
             )
+            if raise_on_rate_limit:
+                raise
         except TooManyRequestsException:
             _logger.warning("send_raw '%s': rate limited by cloud — blocking MQTT sends for 12h", self.device_name)
             transport.set_rate_limited()
+            if raise_on_rate_limit:
+                raise
         except DeviceOfflineException:
             ble = self._on_device_offline(transport)
             if ble is None:
