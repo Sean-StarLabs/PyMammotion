@@ -416,6 +416,8 @@ class HashList(DataClassORJSONMixin):
     )
     """Area hashes committed by the latest successful map fetch in this process."""
     current_mow_path: dict[int, dict[int, MowPath]] = field(default_factory=dict)
+    current_mow_path_session_id: int = 0
+    planned_mow_path_pending: bool = False
     generated_geojson: dict[str, Any] = field(default_factory=dict)
     geojson_yaw: float = 0.0  # RTK yaw (radians) used when generated_geojson was last built
     generated_mow_path_geojson: dict[str, Any] = field(default_factory=dict)
@@ -916,6 +918,7 @@ class HashList(DataClassORJSONMixin):
     def commit_mow_path_transactions(
         self,
         transactions: dict[int, dict[int, MowPath]],
+        session_id: int = 0,
         *,
         replace: bool = False,
     ) -> None:
@@ -928,7 +931,14 @@ class HashList(DataClassORJSONMixin):
         if incomplete:
             msg = f"cannot commit incomplete mow-path transactions: {sorted(incomplete)}"
             raise ValueError(msg)
+        if replace or (session_id and self.current_mow_path_session_id not in (0, session_id)):
+            self.generated_mow_path_geojson = {}
+            self.generated_mow_progress_geojson = {}
+        if session_id and self.current_mow_path_session_id not in (0, session_id):
+            self.current_mow_path = {}
         self.current_mow_path = dict(transactions) if replace else {**self.current_mow_path, **transactions}
+        self.current_mow_path_session_id = session_id
+        self.planned_mow_path_pending = replace and session_id > 0
 
     @staticmethod
     def mow_path_transaction_complete(frames: dict[int, MowPath]) -> bool:
@@ -1081,18 +1091,21 @@ class HashList(DataClassORJSONMixin):
         self.root_hash_lists = [rl for rl in self.root_hash_lists if rl.sub_cmd != 0]
         self.update_hash_lists(self.hashlist)
 
-    def invalidate_mow_path(self, path_hash: int) -> None:
-        """Clear cached mow-path data once the job has ended.
+    def clear_mow_path(self) -> None:
+        """Clear cached cover-path data at a confirmed session boundary."""
+        self.root_hash_lists = [
+            root for root in self.root_hash_lists if root.sub_cmd != 3
+        ]
+        self.current_mow_path = {}
+        self.current_mow_path_session_id = 0
+        self.planned_mow_path_pending = False
+        self.generated_mow_path_geojson = {}
+        self.generated_mow_progress_geojson = {}
+        self.last_ub_path_hash = 0
 
-        Only fires for ``path_hash in (0, 1)``.  Non-zero mid-job values must
-        be preserved — the device advances ub_path_hash through segments during
-        a mow and wiping on every change would discard live data.
-        """
-        if path_hash == 0:
-            self.current_mow_path = {}
-            self.generated_mow_path_geojson = {}
-            self.generated_mow_progress_geojson = {}
-            self.last_ub_path_hash = 0
+    def has_mow_path_for_session(self, session_id: int) -> bool:
+        """Return whether cached cover-path data belongs to *session_id*."""
+        return bool(session_id and self.current_mow_path and self.current_mow_path_session_id == session_id)
 
     def has_mow_path_for_hash(self, path_hash: int) -> bool:
         """Return True if cover-path data for *path_hash* is already cached.

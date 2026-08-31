@@ -20,6 +20,7 @@ from pymammotion.http.model.http import (
     Response,
 )
 from pymammotion.transport.base import TransportType
+from pymammotion.utility.constant import WorkMode
 
 
 # ---------------------------------------------------------------------------
@@ -346,16 +347,266 @@ async def test_start_mow_path_saga_commits_result_on_completion() -> None:
         mock_saga_instance.execute = AsyncMock()
         mock_saga_instance.result = {}
         mock_saga_instance.result_root_hash_list = RootHashList(sub_cmd=3)
+        mock_saga_instance.started_session_id = 3
+        mock_saga_instance.result_session_id = 3
         MockSaga.return_value = mock_saga_instance
 
-        await client.start_mow_path_saga("Luba-Mow", zone_hashs=[1, 2])
+        await client.start_mow_path_saga(
+            "Luba-Mow",
+            zone_hashs=[1, 2],
+            skip_planning=True,
+        )
         await asyncio.sleep(0.15)
 
     handle.commit_mow_path_transactions.assert_awaited_once_with(
         {},
-        replace=True,
+        3,
+        validate_current_session=True,
+        replace=False,
         line_hash_list=mock_saga_instance.result_root_hash_list,
+        clear_dynamics_line=False,
     )
+    assert callable(MockSaga.call_args.kwargs["get_mow_session_id"])
+    await handle.stop()
+
+
+async def test_restored_route_verification_replaces_cached_geometry() -> None:
+    """A forced recovery replaces both cached route and live-line ownership."""
+    client = MammotionClient()
+    handle = await _make_mower_handle_with_transport("dev1", "Luba-Verify")
+    await client._device_registry.register(handle)
+    handle.state_machine.current.raw.mow_session_id = 3
+    handle.commit_mow_path_transactions = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    handle.clear_restored_mow_path_verification = MagicMock()  # type: ignore[method-assign]
+
+    with patch("pymammotion.client.MowPathSaga") as mock_saga:
+        saga = MagicMock()
+        saga.name = "mow_path_fetch"
+        saga.max_attempts = 1
+        saga.execute = AsyncMock()
+        saga.result = {20: {1: MagicMock()}}
+        saga.result_root_hash_list = RootHashList(sub_cmd=3)
+        saga.started_session_id = 3
+        saga.result_session_id = 3
+        mock_saga.return_value = saga
+
+        await client.start_mow_path_saga(
+            "Luba-Verify",
+            zone_hashs=[],
+            skip_planning=True,
+            force_refresh=True,
+        )
+        await asyncio.sleep(0.15)
+
+    assert mock_saga.call_args.kwargs["force_refresh"] is True
+    handle.commit_mow_path_transactions.assert_awaited_once_with(
+        saga.result,
+        3,
+        validate_current_session=True,
+        replace=True,
+        line_hash_list=saga.result_root_hash_list,
+        clear_dynamics_line=True,
+    )
+    handle.clear_restored_mow_path_verification.assert_called_once_with(3)
+    await handle.stop()
+
+
+async def test_restored_route_ready_before_watcher_setup_is_verified() -> None:
+    """Watcher setup schedules verification already enabled by fresh telemetry."""
+    client = MammotionClient()
+    handle = await _make_mower_handle_with_transport("dev1", "Luba-Restored")
+    await client._device_registry.register(handle)
+    device = handle.snapshot.raw
+    device.mow_session_id = 3
+    device.report_data.dev.sys_status = WorkMode.MODE_WORKING
+    device.report_data.work.path_hash = 456
+    handle._restored_mow_path_session_id = 3  # noqa: SLF001
+    handle._restored_mow_path_verification_ready = True  # noqa: SLF001
+    handle.has_queued_commands = MagicMock(return_value=False)  # type: ignore[method-assign]
+    client.start_mow_path_saga = AsyncMock()  # type: ignore[method-assign]
+
+    with patch("pymammotion.client._should_fetch_mow_path", return_value=True):
+        client.setup_device_watchers(device.name)
+        await asyncio.sleep(0)
+
+    client.start_mow_path_saga.assert_awaited_once_with(
+        device.name,
+        zone_hashs=[],
+        route_info=ANY,
+        skip_planning=True,
+        force_refresh=True,
+    )
+    await handle.stop()
+
+
+async def test_restored_route_verification_retries_after_failure() -> None:
+    """A failed replacement remains pending for the next eligible report."""
+    client = MammotionClient()
+    handle = await _make_mower_handle_with_transport("dev1", "Luba-Retry")
+    await client._device_registry.register(handle)
+    device = handle.snapshot.raw
+    device.mow_session_id = 3
+    device.report_data.dev.sys_status = WorkMode.MODE_WORKING
+    device.report_data.work.path_hash = 456
+    handle._restored_mow_path_session_id = 3  # noqa: SLF001
+    handle._restored_mow_path_verification_ready = True  # noqa: SLF001
+    handle.has_queued_commands = MagicMock(return_value=False)  # type: ignore[method-assign]
+    client.start_mow_path_saga = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[RuntimeError("temporary failure"), None]
+    )
+
+    with patch("pymammotion.client._should_fetch_mow_path", return_value=True):
+        client.setup_device_watchers(device.name)
+        await asyncio.sleep(0)
+        await handle.emit_state_changed(handle.snapshot)
+
+    assert client.start_mow_path_saga.await_count == 2
+    assert handle.restored_mow_path_verification_session_id == 3
+    await handle.stop()
+
+
+async def test_restored_route_verification_honors_disabled_fetching() -> None:
+    """Verification never overrides an explicit path-fetch opt-out."""
+    client = MammotionClient()
+    handle = await _make_mower_handle_with_transport("dev1", "Luba-Disabled")
+    await client._device_registry.register(handle)
+    device = handle.snapshot.raw
+    device.mow_session_id = 3
+    device.report_data.dev.sys_status = WorkMode.MODE_WORKING
+    device.report_data.work.path_hash = 456
+    handle._restored_mow_path_session_id = 3  # noqa: SLF001
+    handle._restored_mow_path_verification_ready = True  # noqa: SLF001
+    handle.set_mow_path_fetch_enabled(value=False)
+    client.start_mow_path_saga = AsyncMock()  # type: ignore[method-assign]
+
+    client.setup_device_watchers(device.name)
+    await asyncio.sleep(0)
+
+    client.start_mow_path_saga.assert_not_awaited()
+    assert handle.restored_mow_path_verification_session_id == 3
+    await handle.stop()
+
+
+async def test_planned_mow_path_targets_the_next_session() -> None:
+    """A planned route is committed for the next mowing lifecycle."""
+    client = MammotionClient()
+    handle = await _make_mower_handle_with_transport("dev1", "Luba-Plan")
+    await client._device_registry.register(handle)
+    handle.state_machine.current.raw.mow_session_id = 3
+    handle.commit_mow_path_transactions = AsyncMock()  # type: ignore[method-assign]
+
+    with patch("pymammotion.client.MowPathSaga") as MockSaga:
+        saga = MagicMock()
+        saga.name = "mow_path_fetch"
+        saga.max_attempts = 1
+        saga.result = {}
+        saga.started_session_id = 3
+        saga.result_session_id = 4
+        saga.result_root_hash_list = RootHashList(sub_cmd=3)
+
+        async def execute(_broker: object) -> None:
+            pass
+
+        saga.execute = execute
+        MockSaga.return_value = saga
+        await client.start_mow_path_saga("Luba-Plan", zone_hashs=[1])
+        await asyncio.sleep(0.15)
+
+    handle.commit_mow_path_transactions.assert_awaited_once_with(
+        {},
+        4,
+        validate_current_session=False,
+        replace=True,
+        line_hash_list=saga.result_root_hash_list,
+        clear_dynamics_line=False,
+    )
+    await handle.stop()
+
+
+async def test_planned_mow_path_rejects_changed_session_before_commit() -> None:
+    """A transfer is discarded when another mowing session supersedes it."""
+    client = MammotionClient()
+    handle = await _make_mower_handle_with_transport("dev1", "Luba-Plan-Stale")
+    await client._device_registry.register(handle)
+    handle.state_machine.current.raw.mow_session_id = 3
+    handle.commit_mow_path_transactions = AsyncMock()  # type: ignore[method-assign]
+
+    with patch("pymammotion.client.MowPathSaga") as MockSaga:
+        saga = MagicMock()
+        saga.name = "mow_path_fetch"
+        saga.max_attempts = 1
+        saga.result = {}
+        saga.started_session_id = 3
+        saga.result_session_id = 4
+        saga.result_root_hash_list = RootHashList(sub_cmd=3)
+
+        async def execute(_broker: object) -> None:
+            handle.state_machine.current.raw.mow_session_id = 5
+
+        saga.execute = execute
+        MockSaga.return_value = saga
+        await client.start_mow_path_saga("Luba-Plan-Stale", zone_hashs=[1])
+        await asyncio.sleep(0.15)
+
+    handle.commit_mow_path_transactions.assert_not_awaited()
+    await handle.stop()
+
+
+async def test_running_mow_path_binds_session_when_saga_executes() -> None:
+    """A queued recovery commits against the session active at dispatch time."""
+    client = MammotionClient()
+    handle = await _make_mower_handle_with_transport("dev1", "Luba-Recovery")
+    await client._device_registry.register(handle)
+    handle.state_machine.current.raw.mow_session_id = 3
+    handle.commit_mow_path_transactions = AsyncMock()  # type: ignore[method-assign]
+    handle.queue.pause_for_reconnect()
+
+    with patch("pymammotion.client.MowPathSaga") as mock_saga:
+        saga = MagicMock()
+        saga.name = "mow_path_fetch"
+        saga.max_attempts = 1
+        saga.result = {}
+        saga.result_root_hash_list = RootHashList(sub_cmd=3)
+
+        async def execute(_broker: object) -> None:
+            saga.started_session_id = saga.result_session_id = saga_call.kwargs[
+                "get_mow_session_id"
+            ]()
+
+        saga.execute = execute
+        mock_saga.return_value = saga
+        await client.start_mow_path_saga("Luba-Recovery", zone_hashs=[], skip_planning=True)
+        saga_call = mock_saga.call_args
+        handle.state_machine.current.raw.mow_session_id = 4
+        handle.queue.resume_after_reconnect()
+        await asyncio.sleep(0.15)
+
+    handle.commit_mow_path_transactions.assert_awaited_once_with(
+        {},
+        4,
+        validate_current_session=True,
+        replace=False,
+        line_hash_list=saga.result_root_hash_list,
+        clear_dynamics_line=False,
+    )
+    await handle.stop()
+
+
+async def test_queued_route_recovery_does_not_commit_after_task_ends() -> None:
+    """A recovery queued for a finished task becomes a no-op at dispatch."""
+    client = MammotionClient()
+    handle = await _make_mower_handle_with_transport("dev1", "Luba-Recovery-End")
+    await client._device_registry.register(handle)
+    handle.state_machine.current.raw.mow_session_id = 3
+    handle.commit_mow_path_transactions = AsyncMock()  # type: ignore[method-assign]
+    handle.queue.pause_for_reconnect()
+
+    await client.start_mow_path_saga("Luba-Recovery-End", zone_hashs=[], skip_planning=True)
+    handle.state_machine.current.raw.mow_session_id = 0
+    handle.queue.resume_after_reconnect()
+    await asyncio.sleep(0.15)
+
+    handle.commit_mow_path_transactions.assert_not_awaited()
     await handle.stop()
 
 
@@ -1319,7 +1570,7 @@ async def test_update_ble_device_returns_true_on_first_set_false_on_same_address
 
     assert await client.update_ble_device("Luba-Update", dev1) is True
     assert await client.update_ble_device("Luba-Update", dev2) is False  # same address
-    assert await client.update_ble_device("Luba-Update", dev3) is True   # different address
+    assert await client.update_ble_device("Luba-Update", dev3) is True  # different address
 
     await handle.stop()
 
@@ -1661,8 +1912,8 @@ async def test_has_usable_transport_true_when_offline_with_ble_usable_but_discon
     handle = make_handle("dev1", "Luba-Recovery")
     mqtt = _make_connected_transport(TransportType.CLOUD_ALIYUN)
     ble = _make_connected_transport(TransportType.BLE)
-    ble.is_connected = False     # GATT not up yet
-    ble.is_usable = True         # has cached BLEDevice, not in cooldown
+    ble.is_connected = False  # GATT not up yet
+    ble.is_usable = True  # has cached BLEDevice, not in cooldown
     await handle.add_transport(mqtt)
     await handle.add_transport(ble)
     handle._availability = DeviceAvailability(  # noqa: SLF001
