@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from unittest.mock import ANY, AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
 
 from pymammotion.account.registry import AccountSession
 from pymammotion.client import MammotionClient
+from pymammotion.data.model.hash_list import RootHashList
 from pymammotion.device.handle import DeviceHandle, DeviceRegistry
 from pymammotion.http.http import MammotionHTTP
 from pymammotion.http.model.http import (
@@ -347,6 +349,7 @@ async def test_start_mow_path_saga_commits_result_on_completion() -> None:
         mock_saga_instance.result = {}
         mock_saga_instance.started_path_hash = 123
         mock_saga_instance.result_path_hash = 123
+        mock_saga_instance.result_root_hash_list = RootHashList(sub_cmd=3)
         MockSaga.return_value = mock_saga_instance
 
         await client.start_mow_path_saga(
@@ -362,6 +365,7 @@ async def test_start_mow_path_saga_commits_result_on_completion() -> None:
         validate_current_task=True,
         replace=False,
         planned_from_path_hash=0,
+        line_hash_list=mock_saga_instance.result_root_hash_list,
     )
     assert callable(MockSaga.call_args.kwargs["get_task_path_hash"])
     await handle.stop()
@@ -382,6 +386,7 @@ async def test_planned_mow_path_accepts_device_confirmed_route_hash() -> None:
         saga.result = {}
         saga.started_path_hash = 100
         saga.result_path_hash = 200
+        saga.result_root_hash_list = RootHashList(sub_cmd=3)
 
         async def execute(_broker: object) -> None:
             handle.state_machine.current.raw.report_data.work.path_hash = 200
@@ -397,6 +402,7 @@ async def test_planned_mow_path_accepts_device_confirmed_route_hash() -> None:
         validate_current_task=False,
         replace=True,
         planned_from_path_hash=100,
+        line_hash_list=saga.result_root_hash_list,
     )
     await handle.stop()
 
@@ -443,6 +449,7 @@ async def test_running_mow_path_binds_hash_when_saga_executes() -> None:
         saga.name = "mow_path_fetch"
         saga.max_attempts = 1
         saga.result = {}
+        saga.result_root_hash_list = RootHashList(sub_cmd=3)
 
         async def execute(_broker: object) -> None:
             saga.started_path_hash = saga.result_path_hash = saga_call.kwargs["get_task_path_hash"]()
@@ -461,6 +468,7 @@ async def test_running_mow_path_binds_hash_when_saga_executes() -> None:
         validate_current_task=True,
         replace=False,
         planned_from_path_hash=0,
+        line_hash_list=saga.result_root_hash_list,
     )
     await handle.stop()
 
@@ -841,6 +849,104 @@ async def test_send_command_with_args_stamps_user_command_on_handle() -> None:
     await client.send_command_with_args("Luba-TS", "start_job")
 
     assert handle._rearm_event.is_set()  # noqa: SLF001
+
+
+async def test_send_command_with_args_can_preempt_read_sagas() -> None:
+    """A preempting fire-and-forget command uses the queue's atomic operation."""
+    client = MammotionClient()
+    mqtt = _make_connected_transport(TransportType.CLOUD_ALIYUN)
+    handle = make_handle("dev1", "Luba-Preempt")
+    await handle.add_transport(mqtt)
+    await client._device_registry.register(handle)
+
+    async def run(work: Callable[[], Awaitable[None]]) -> None:
+        await work()
+
+    handle.run_after_preempting_reads = AsyncMock(side_effect=run)  # type: ignore[method-assign]
+
+    await client.send_command_with_args(
+        "Luba-Preempt",
+        "start_job",
+        preempt_reads=True,
+    )
+
+    handle.run_after_preempting_reads.assert_awaited_once()
+    mqtt.send.assert_awaited_once()
+
+
+async def test_preempting_command_reports_missing_transport() -> None:
+    """A preempting command cannot invalidate reads without being sent."""
+    from pymammotion.transport.base import NoTransportAvailableError  # noqa: PLC0415
+
+    client = MammotionClient()
+    handle = make_handle("dev1", "Luba-Offline")
+    await handle.start()
+    await client._device_registry.register(handle)
+
+    with pytest.raises(NoTransportAvailableError):
+        await client.send_command_with_args(
+            "Luba-Offline",
+            "start_job",
+            preempt_reads=True,
+        )
+
+    await handle.stop()
+
+
+async def test_preempting_command_reports_rate_limited_send() -> None:
+    """A suppressed transport error cannot invalidate preempted reads."""
+    from pymammotion.transport.base import TransportRateLimitedError  # noqa: PLC0415
+
+    client = MammotionClient()
+    mqtt = _make_connected_transport(TransportType.CLOUD_ALIYUN)
+    handle = make_handle("dev1", "Luba-Rate-Limited")
+    await handle.add_transport(mqtt)
+    await handle.start()
+    await client._device_registry.register(handle)
+    handle.send_raw = AsyncMock(side_effect=TransportRateLimitedError("rate limited"))  # type: ignore[method-assign]
+
+    with pytest.raises(TransportRateLimitedError):
+        await client.send_command_with_args(
+            "Luba-Rate-Limited",
+            "start_job",
+            preempt_reads=True,
+        )
+
+    handle.send_raw.assert_awaited_once_with(
+        ANY,
+        prefer_ble=False,
+        raise_on_rate_limit=True,
+    )
+    await handle.stop()
+
+
+async def test_response_waiter_is_registered_at_queued_dispatch() -> None:
+    """A preempting request cannot consume a response while reconnect-gated."""
+    client = MammotionClient()
+    mqtt = _make_connected_transport(TransportType.CLOUD_ALIYUN)
+    handle = make_handle("dev1", "Luba-Waiter")
+    await handle.add_transport(mqtt)
+    await client._device_registry.register(handle)
+    handle.queue.pause_for_reconnect()
+
+    request = asyncio.create_task(
+        client.send_command_and_wait(
+            "Luba-Waiter",
+            "start_job",
+            "some_field",
+            send_timeout=0.1,
+            preempt_reads=True,
+        )
+    )
+    await asyncio.sleep(0)
+
+    assert "some_field" not in handle.broker._pending  # noqa: SLF001
+
+    request.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+    handle.queue.resume_after_reconnect()
+    await handle.stop()
 
 
 async def test_send_command_and_wait_stamps_user_command_on_handle() -> None:

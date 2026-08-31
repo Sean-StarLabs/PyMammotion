@@ -637,7 +637,11 @@ class MammotionClient:
                 await self.on_unrecoverable_auth_error(session.account_id, transport_type, exc)
 
     async def _send_with_auth_retry(
-        self, send_fn: Callable[[], Awaitable[None]], session: AccountSession | None = None
+        self,
+        send_fn: Callable[[], Awaitable[None]],
+        session: AccountSession | None = None,
+        *,
+        raise_transport_errors: bool = False,
     ) -> None:
         """Call *send_fn*; on an auth failure refresh that transport's credentials once and retry.
 
@@ -664,6 +668,8 @@ class MammotionClient:
             # swallowed into a log line and the host would never prompt for re-auth.
             raise
         except TransportError as ex:
+            if raise_transport_errors:
+                raise
             _logger.warning(ex)
 
     # ------------------------------------------------------------------
@@ -2426,6 +2432,7 @@ class MammotionClient:
                     validate_current_task=skip_planning,
                     replace=not skip_planning,
                     planned_from_path_hash=saga.started_path_hash if not skip_planning else 0,
+                    line_hash_list=saga.result_root_hash_list,
                 )
 
             await handle.enqueue_saga(saga, on_complete=_on_mow_path_complete)
@@ -2722,6 +2729,7 @@ class MammotionClient:
         *,
         prefer_ble: bool = False,
         skip_if_saga_active: bool = False,
+        preempt_reads: bool = False,
         _record_cmd: bool = True,
         **kwargs: Any,
     ) -> None:
@@ -2742,6 +2750,8 @@ class MammotionClient:
                                  Use for fire-and-forget UI ops (volume, knife height,
                                  light toggle) that the user expects to take effect
                                  immediately rather than queue behind a long fetch.
+            preempt_reads:       Cancel or discard read-only transfers and dispatch
+                                 after any active write saga finishes.
             _record_cmd:         Internal flag — set False for watchdog-initiated sends
                                  so they do not stamp _last_user_command_ts and
                                  inadvertently lock the watchdog into the 60 s window.
@@ -2786,13 +2796,23 @@ class MammotionClient:
                     name,
                     key,
                 )
+                if preempt_reads:
+                    raise NoTransportAvailableError(f"No usable transport for '{name}'")
                 return
             await self._send_with_auth_retry(
-                lambda: handle.send_raw(command_bytes, prefer_ble=_prefer_ble),
+                lambda: handle.send_raw(
+                    command_bytes,
+                    prefer_ble=_prefer_ble,
+                    raise_on_rate_limit=preempt_reads,
+                ),
                 _session,
+                raise_transport_errors=preempt_reads,
             )
 
-        await handle.queue.enqueue(_do_send, priority=Priority.NORMAL, skip_if_saga_active=skip_if_saga_active)
+        if preempt_reads:
+            await handle.run_after_preempting_reads(_do_send)
+        else:
+            await handle.queue.enqueue(_do_send, priority=Priority.NORMAL, skip_if_saga_active=skip_if_saga_active)
 
     async def send_command_and_wait(
         self,
@@ -2802,6 +2822,7 @@ class MammotionClient:
         *,
         send_timeout: float = 5.0,
         prefer_ble: bool = True,
+        preempt_reads: bool = False,
         **kwargs: Any,
     ) -> Any:
         """Send a command and wait for the matching protobuf response.
@@ -2814,12 +2835,14 @@ class MammotionClient:
             key:            Method name on :class:`MammotionCommand`.
             expected_field: Protobuf oneof field name expected in response.
             send_timeout:   Seconds to wait per attempt.
+            prefer_ble:     Prefer BLE when both transports are available.
+            preempt_reads:  Cancel or discard read-only transfers and dispatch
+                            after any active write saga finishes.
             **kwargs:       Arguments passed to the command builder.
 
         Raises:
             KeyError:             if *name* is not a registered device.
             CommandTimeoutError:  if no response after retries.
-            :param prefer_ble:
 
         """
         handle = self._device_registry.get_by_name(name)
@@ -2833,15 +2856,33 @@ class MammotionClient:
 
         async def _send() -> None:
             await self._send_with_auth_retry(
-                lambda: handle.send_raw(payload=command_bytes, prefer_ble=prefer_ble),
+                lambda: handle.send_raw(
+                    payload=command_bytes,
+                    prefer_ble=prefer_ble,
+                    raise_on_rate_limit=preempt_reads,
+                ),
                 _session,
+                raise_transport_errors=preempt_reads,
             )
 
-        return await handle.broker.send_and_wait(
-            send_fn=_send,
-            expected_field=expected_field,
-            send_timeout=send_timeout,
-        )
+        async def _request() -> Any:
+            return await handle.broker.send_and_wait(
+                send_fn=_send,
+                expected_field=expected_field,
+                send_timeout=send_timeout,
+            )
+
+        if not preempt_reads:
+            return await _request()
+
+        response: Any = None
+
+        async def _queued_request() -> None:
+            nonlocal response
+            response = await _request()
+
+        await handle.run_after_preempting_reads(_queued_request)
+        return response
 
     def set_prefer_ble(self, device_id: str, *, prefer_ble: bool) -> None:
         """Set transport preference for a registered device."""
