@@ -294,14 +294,14 @@ class BLETransport(Transport):
 
             self._message = BleMessage(self._client)
 
-            # BlueZ may retain a stale notify subscription from a previous ungraceful
-            # disconnect.  Release it proactively so start_notify doesn't get
-            # [org.bluez.Error.NotPermitted] Notify acquired.
-            with contextlib.suppress(Exception):
-                await self._client.stop_notify(UUID_NOTIFICATION_CHARACTERISTIC)
-            # Both steps below run against an established link, and both leave the
-            # transport unusable when they fail, so they share one teardown path.
             try:
+                # BlueZ may retain a stale notify subscription from a previous
+                # ungraceful disconnect. Release it proactively so start_notify
+                # doesn't get [org.bluez.Error.NotPermitted] Notify acquired.
+                with contextlib.suppress(Exception):
+                    await self._client.stop_notify(
+                        UUID_NOTIFICATION_CHARACTERISTIC
+                    )
                 try:
                     await self._client.start_notify(UUID_NOTIFICATION_CHARACTERISTIC, self._notification_handler)
                 except BleakError as exc:
@@ -324,6 +324,15 @@ class BLETransport(Transport):
                 # One-shot sync on connect — subsequent periodic syncs are driven by
                 # DeviceHandle._keep_alive_loop (20 s).
                 await self._ble_sync()
+            except asyncio.CancelledError:
+                # A caller can time out a send while connect() is still installing
+                # notifications. Do not retain a connected client without a receiver.
+                with contextlib.suppress(Exception):
+                    await self._client.disconnect()
+                self._client = None
+                self._message = None
+                await self._notify_availability(TransportAvailability.DISCONNECTED)
+                raise
             except (BleakError, TimeoutError, OSError) as exc:
                 # The link came up but notify or the very first write failed, so the
                 # transport is not actually usable.  is_connected reads the live client,

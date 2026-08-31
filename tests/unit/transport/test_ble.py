@@ -144,6 +144,71 @@ async def test_connect_wraps_bleak_error_from_initial_sync(config: BLETransportC
     fake_client.disconnect.assert_awaited()
 
 
+async def test_connect_cancellation_cleans_up_partial_notification_setup(config: BLETransportConfig) -> None:
+    """A timed-out caller cannot leave a connected client without notifications."""
+    transport = BLETransport(config)
+    transport.set_ble_device(MagicMock(spec=BLEDevice))
+    fake_client = _make_fake_client()
+    fake_msg = _make_fake_ble_message()
+    notify_started = asyncio.Event()
+
+    async def block_notify(*_args: object) -> None:
+        notify_started.set()
+        await asyncio.Event().wait()
+
+    fake_client.start_notify.side_effect = block_notify
+
+    with (
+        patch("pymammotion.transport.ble.establish_connection", new=AsyncMock(return_value=fake_client)),
+        patch("pymammotion.transport.ble.BleMessage", return_value=fake_msg),
+    ):
+        task = asyncio.create_task(transport.connect())
+        await asyncio.wait_for(notify_started.wait(), timeout=2.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert transport.is_connected is False
+    assert transport._message is None  # noqa: SLF001
+    assert transport.availability is TransportAvailability.DISCONNECTED
+    fake_client.disconnect.assert_awaited_once()
+
+
+async def test_connect_cancellation_cleans_up_while_releasing_stale_notify(
+    config: BLETransportConfig,
+) -> None:
+    """Cancellation during stale-notify cleanup cannot retain a half-open link."""
+    transport = BLETransport(config)
+    transport.set_ble_device(MagicMock(spec=BLEDevice))
+    fake_client = _make_fake_client()
+    fake_msg = _make_fake_ble_message()
+    stop_started = asyncio.Event()
+
+    async def block_stop(*_args: object) -> None:
+        stop_started.set()
+        await asyncio.Event().wait()
+
+    fake_client.stop_notify.side_effect = block_stop
+
+    with (
+        patch(
+            "pymammotion.transport.ble.establish_connection",
+            new=AsyncMock(return_value=fake_client),
+        ),
+        patch("pymammotion.transport.ble.BleMessage", return_value=fake_msg),
+    ):
+        task = asyncio.create_task(transport.connect())
+        await asyncio.wait_for(stop_started.wait(), timeout=2.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert transport.is_connected is False
+    assert transport._message is None  # noqa: SLF001
+    assert transport.availability is TransportAvailability.DISCONNECTED
+    fake_client.disconnect.assert_awaited_once()
+
+
 # ---------------------------------------------------------------------------
 # disconnect() sends final sync, clears client and message
 # ---------------------------------------------------------------------------
