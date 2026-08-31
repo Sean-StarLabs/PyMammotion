@@ -467,6 +467,11 @@ class WorkData(DataClassORJSONMixin):
     cutter_width: float = 0.0
 
     @property
+    def task_path_hash(self) -> int:
+        """Return the device-reported task hash, excluding idle sentinels."""
+        return self.path_hash if self.path_hash not in (0, 1) else 0
+
+    @property
     def mow_percent(self) -> int:
         """Mow completion percentage (0–100), packed in upper 16 bits of ``area``."""
         return self.area >> 16

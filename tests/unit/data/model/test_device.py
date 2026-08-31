@@ -1,10 +1,20 @@
 """Tests for MowingDevice JSON serialization with int-keyed HashList fields."""
+
 from __future__ import annotations
 
 import json
 
 from pymammotion.data.model.device import MowingDevice
-from pymammotion.data.model.hash_list import FrameList, HashList, MowPath, NavGetCommData
+from pymammotion.data.model.hash_list import (
+    FrameList,
+    HashList,
+    MowPath,
+    NavGetCommData,
+    RootHashList,
+)
+from pymammotion.data.model.report_info import WorkData
+from pymammotion.proto import ReportInfoData, RptDevStatus, RptWork
+from pymammotion.utility.constant import WorkMode
 
 
 def _make_hash_list_with_int_keys() -> HashList:
@@ -49,6 +59,200 @@ def test_empty_mowing_device_roundtrip() -> None:
     assert json_str
     data = json.loads(json_str)
     assert data["name"] == "empty"
+
+
+def test_new_mow_session_clears_route_from_the_previous_session() -> None:
+    """Only a reported transition into a new mowing lifecycle clears a route."""
+    device = MowingDevice(name="Yuka-Test", mow_session_id=4)
+    device.map = _make_hash_list_with_int_keys()
+    device.map.current_mow_path_session_id = 4
+    device.report_data.dev.sys_status = WorkMode.MODE_READY
+
+    device.update_report_data(
+        ReportInfoData(
+            dev=RptDevStatus(sys_status=WorkMode.MODE_WORKING),
+            work=RptWork(path_hash=123),
+        )
+    )
+
+    assert device.mow_session_id == 5
+    assert device.map.current_mow_path == {}
+
+
+def test_new_mow_session_clears_manifest_without_cached_route() -> None:
+    """A prior manifest cannot be reused when the next session has no route packets."""
+    device = MowingDevice(name="Yuka-Test", mow_session_id=4)
+    device.map.root_hash_lists = [RootHashList(sub_cmd=3)]
+    device.report_data.dev.sys_status = WorkMode.MODE_READY
+
+    device.update_report_data(
+        ReportInfoData(
+            dev=RptDevStatus(sys_status=WorkMode.MODE_WORKING),
+            work=RptWork(path_hash=123),
+        )
+    )
+
+    assert device.mow_session_id == 5
+    assert device.map.root_hash_lists == []
+
+
+def test_planned_route_is_adopted_by_the_next_mow_session() -> None:
+    """A route planned for the next session survives the start transition."""
+    device = MowingDevice(name="Yuka-Test", mow_session_id=4)
+    device.map = _make_hash_list_with_int_keys()
+    device.map.current_mow_path_session_id = 5
+    device.map.planned_mow_path_pending = True
+    device.map.root_hash_lists = [RootHashList(sub_cmd=3)]
+    device.report_data.dev.sys_status = WorkMode.MODE_READY
+
+    device.update_report_data(
+        ReportInfoData(
+            dev=RptDevStatus(sys_status=WorkMode.MODE_WORKING),
+            work=RptWork(path_hash=123),
+        )
+    )
+
+    assert device.mow_session_id == 5
+    assert device.map.current_mow_path
+    assert device.map.current_mow_path_session_id == 5
+    assert device.map.planned_mow_path_pending is False
+    assert [root.sub_cmd for root in device.map.root_hash_lists] == [3]
+
+
+def test_path_hash_rotation_does_not_change_session_or_clear_route() -> None:
+    """Yuka path hashes may rotate repeatedly during one reported mowing job."""
+    device = MowingDevice(name="Yuka-Test", mow_session_id=5)
+    device.map = _make_hash_list_with_int_keys()
+    device.map.current_mow_path_session_id = 5
+    device.report_data.dev.sys_status = WorkMode.MODE_WORKING
+    device.report_data.work = WorkData(path_hash=123, ub_path_hash=456)
+
+    device.update_report_data(
+        ReportInfoData(
+            dev=RptDevStatus(sys_status=WorkMode.MODE_WORKING),
+            work=RptWork(path_hash=789, ub_path_hash=987),
+        )
+    )
+
+    assert device.mow_session_id == 5
+    assert device.map.current_mow_path
+
+
+def test_pause_return_and_charging_pause_remain_in_same_session() -> None:
+    """Every non-terminal mowing mode retains the current session route."""
+    device = MowingDevice(name="Yuka-Test", mow_session_id=5)
+    device.map = _make_hash_list_with_int_keys()
+    device.map.current_mow_path_session_id = 5
+    device.report_data.dev.sys_status = WorkMode.MODE_WORKING
+
+    for mode in (
+        WorkMode.MODE_PAUSE,
+        WorkMode.MODE_RETURNING,
+        WorkMode.MODE_CHARGING_PAUSE,
+        WorkMode.MODE_WORKING,
+    ):
+        device.update_report_data(
+            ReportInfoData(
+                dev=RptDevStatus(sys_status=mode, sys_time_stamp=1),
+                work=RptWork(path_hash=1),
+            )
+        )
+
+    assert device.mow_session_id == 5
+    assert device.map.current_mow_path
+
+
+def test_completed_route_is_retained_until_the_next_session() -> None:
+    """Finishing a job keeps its native route available for the map."""
+    device = MowingDevice(name="Yuka-Test", mow_session_id=5)
+    device.map = _make_hash_list_with_int_keys()
+    device.map.current_mow_path_session_id = 5
+    device.report_data.dev.sys_status = WorkMode.MODE_WORKING
+
+    device.update_report_data(
+        ReportInfoData(
+            dev=RptDevStatus(sys_status=WorkMode.MODE_READY, sys_time_stamp=1),
+            work=RptWork(path_hash=1),
+        )
+    )
+
+    assert device.mow_session_id == 5
+    assert device.map.current_mow_path
+
+
+def test_returning_from_ready_does_not_create_a_mow_session() -> None:
+    """A standalone return-to-dock trip is not a new mowing job."""
+    device = MowingDevice(name="Yuka-Test", mow_session_id=5)
+    device.map = _make_hash_list_with_int_keys()
+    device.map.current_mow_path_session_id = 5
+    device.report_data.dev.sys_status = WorkMode.MODE_READY
+
+    device.update_report_data(
+        ReportInfoData(
+            dev=RptDevStatus(sys_status=WorkMode.MODE_RETURNING, sys_time_stamp=1),
+            work=RptWork(path_hash=1),
+        )
+    )
+
+    assert device.mow_session_id == 5
+    assert device.map.current_mow_path
+
+
+def test_active_job_bootstraps_session_identity_after_upgrade() -> None:
+    """Persisted active telemetry without the new field acquires an identity."""
+    device = MowingDevice(name="Yuka-Test")
+    device.report_data.dev.sys_status = WorkMode.MODE_CHARGING_PAUSE
+
+    device.update_report_data(
+        ReportInfoData(
+            dev=RptDevStatus(sys_status=WorkMode.MODE_CHARGING_PAUSE, sys_time_stamp=1),
+            work=RptWork(path_hash=123),
+        )
+    )
+
+    assert device.mow_session_id == 1
+
+
+def test_status_only_frame_starts_mow_session() -> None:
+    """Status and work telemetry can arrive in separate device reports."""
+    device = MowingDevice(name="Yuka-Test", mow_session_id=4)
+    device.report_data.dev.sys_status = WorkMode.MODE_READY
+
+    device.update_report_data(
+        ReportInfoData(dev=RptDevStatus(sys_status=WorkMode.MODE_WORKING))
+    )
+
+    assert device.mow_session_id == 5
+
+
+def test_partial_reports_preserve_active_session_and_path_hash() -> None:
+    """Incomplete telemetry cannot create a false session boundary."""
+    device = MowingDevice(name="Yuka-Test", mow_session_id=5)
+    device.map = _make_hash_list_with_int_keys()
+    device.map.current_mow_path_session_id = 5
+    device.report_data.dev.sys_status = WorkMode.MODE_WORKING
+    device.report_data.work = WorkData(path_hash=123)
+
+    device.update_report_data(
+        ReportInfoData(
+            dev=RptDevStatus(battery_val=42),
+            work=RptWork(path_hash=1),
+        )
+    )
+
+    assert device.report_data.dev.sys_status == WorkMode.MODE_WORKING
+    assert device.report_data.work.path_hash == 123
+    assert device.mow_session_id == 5
+    assert device.map.current_mow_path
+
+
+def test_mow_session_id_survives_serialization() -> None:
+    """Restored active jobs keep the lifecycle identity that owns their route."""
+    restored = MowingDevice().from_json(
+        MowingDevice(name="Yuka-Test", mow_session_id=7).to_json()
+    )
+
+    assert restored.mow_session_id == 7
 
 
 # ===========================================================================
