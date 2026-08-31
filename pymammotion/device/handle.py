@@ -92,7 +92,7 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
     from pymammotion.data.model.device import Device, MowingDevice
-    from pymammotion.data.model.hash_list import MowPath, RootHashList
+    from pymammotion.data.model.hash_list import CommDataCouple, MowPath, RootHashList
     from pymammotion.data.mqtt.event import ThingEventMessage
     from pymammotion.data.mqtt.properties import MammotionPropertiesMessage, ThingPropertiesMessage
     from pymammotion.data.mqtt.status import ThingStatusMessage
@@ -959,13 +959,27 @@ class DeviceHandle:
             replace=replace,
         )
         if clear_dynamics_line:
-            updated.map.update_dynamics_line([])
-            updated.map.generated_dynamics_line_geojson = {}
+            updated.map.clear_dynamics_line()
         if updated.location.RTK.latitude != 0.0:
             updated.map.generate_mowing_geojson(updated.location.RTK)
         snapshot, _ = self.state_machine.apply(updated, self._availability)
         await self.emit_state_changed(snapshot)
         return True
+
+    async def commit_dynamics_line(self, points: list[CommDataCouple], session_id: int) -> bool:
+        """Publish a complete live route if its mowing session is still active."""
+        current = self.state_machine.current.raw
+        if not isinstance(current, MowerDevice):
+            return False
+        updated = dataclasses.replace(current)
+        updated.map = copy.copy(current.map)
+        accepted = updated.mow_session_id == session_id and updated.report_data.dev.sys_status in MOWING_ACTIVE_MODES
+        if accepted and (points or not current.map.dynamics_line):
+            updated.map.update_dynamics_line(points, session_id)
+            updated.map.apply_dynamics_line_geojson(updated.location.RTK)
+            snapshot, _ = self.state_machine.apply(updated, self._availability)
+            await self.emit_state_changed(snapshot)
+        return accepted
 
     def has_queued_commands(self) -> bool:
         """Return True if the queue has pending work or a saga is active."""
