@@ -136,12 +136,24 @@ class HomeAssistantMowerApi:
         #     self._mark_api_called("get_errors", device_name)
 
         if self._should_call_api("get_report_cfg", device_name):
-            await self.async_send_command(device_name, "get_report_cfg")
+            await self.async_send_command(
+                device_name,
+                "get_report_cfg",
+                preempt_reads=False,
+            )
             self._mark_api_called("get_report_cfg", device_name)
 
         if self._should_call_api("get_maintenance", device_name):
-            await self.async_send_command(device_name, "get_maintenance")
-            await self.async_send_command(device_name, "basestation_info")
+            await self.async_send_command(
+                device_name,
+                "get_maintenance",
+                preempt_reads=False,
+            )
+            await self.async_send_command(
+                device_name,
+                "basestation_info",
+                preempt_reads=False,
+            )
             self._mark_api_called("get_maintenance", device_name)
 
         if self._should_call_api("device_version_upgrade", device_name):
@@ -160,6 +172,7 @@ class HomeAssistantMowerApi:
         Commands are queued and executed in order, yielding to any active saga
         (map/plan/mow-path fetch).
         """
+        kwargs.setdefault("preempt_reads", True)
         try:
             await self._mammotion.send_command_with_args(device_name, command, **kwargs)
         except KeyError:
@@ -291,19 +304,43 @@ class HomeAssistantMowerApi:
 
     async def async_move_forward(self, device_name: str, speed: float, *, use_wifi: bool = False) -> None:
         """Move forward.  Prefer BLE unless use_wifi=True (lower latency for manual control)."""
-        await self._mammotion.send_command_with_args(device_name, "move_forward", prefer_ble=not use_wifi, linear=speed)
+        await self._mammotion.send_command_with_args(
+            device_name,
+            "move_forward",
+            prefer_ble=not use_wifi,
+            preempt_reads=True,
+            linear=speed,
+        )
 
     async def async_move_left(self, device_name: str, speed: float, *, use_wifi: bool = False) -> None:
         """Move left.  Prefer BLE unless use_wifi=True."""
-        await self._mammotion.send_command_with_args(device_name, "move_left", prefer_ble=not use_wifi, angular=speed)
+        await self._mammotion.send_command_with_args(
+            device_name,
+            "move_left",
+            prefer_ble=not use_wifi,
+            preempt_reads=True,
+            angular=speed,
+        )
 
     async def async_move_right(self, device_name: str, speed: float, *, use_wifi: bool = False) -> None:
         """Move right.  Prefer BLE unless use_wifi=True."""
-        await self._mammotion.send_command_with_args(device_name, "move_right", prefer_ble=not use_wifi, angular=speed)
+        await self._mammotion.send_command_with_args(
+            device_name,
+            "move_right",
+            prefer_ble=not use_wifi,
+            preempt_reads=True,
+            angular=speed,
+        )
 
     async def async_move_back(self, device_name: str, speed: float, *, use_wifi: bool = False) -> None:
         """Move back.  Prefer BLE unless use_wifi=True."""
-        await self._mammotion.send_command_with_args(device_name, "move_back", prefer_ble=not use_wifi, linear=speed)
+        await self._mammotion.send_command_with_args(
+            device_name,
+            "move_back",
+            prefer_ble=not use_wifi,
+            preempt_reads=True,
+            linear=speed,
+        )
 
     async def async_rtk_dock_location(self, device_name: str) -> None:
         """RTK and dock location."""
@@ -588,6 +625,11 @@ class HomeAssistantMowerApi:
             if already_set:
                 continue
             try:
-                await self._mammotion.send_command_and_wait(device_name, command, expected_field)
+                await self._mammotion.send_command_and_wait(
+                    device_name,
+                    command,
+                    expected_field,
+                    preempt_reads=False,
+                )
             except (CommandTimeoutError, ConcurrentRequestError) as ex:
                 logger.warning("Device info command '%s' failed for %s: %s", command, device_name, ex)
