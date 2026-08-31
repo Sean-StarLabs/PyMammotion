@@ -1098,7 +1098,7 @@ class DeviceHandle:
         if self._dynamics_line_task is not None and not self._dynamics_line_task.done():
             return
         dt = DeviceType.value_of_str(self.device_name)
-        if not (dt.is_support_dynamics_line() or dt is DeviceType.LUBA_VA):
+        if not (dt.is_support_dynamics_line_polling() or dt is DeviceType.LUBA_VA):
             return
         _logger.debug("start_dynamics_line_loop [%s]: starting dynamics-line poll loop", self.device_name)
         self._dynamics_line_task = asyncio.get_running_loop().create_task(dynamics_line_loop(self))
