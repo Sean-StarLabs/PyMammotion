@@ -3,20 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import nullcontext
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from pymammotion.data.model import GenerateRouteInformation
 from pymammotion.data.model.hash_list import (
     AreaHashNameList,
     HashList,
     MowPath,
+    MowPathPacket,
     NavGetHashListData,
     Plan,
     RootHashList,
 )
-from pymammotion.data.model import GenerateRouteInformation
 from pymammotion.messaging.broker import CommandTimeoutError, DeviceMessageBroker
 from pymammotion.messaging.map_saga import MapFetchSaga
 from pymammotion.messaging.mow_path_saga import MowPathSaga
@@ -815,6 +817,48 @@ def test_mow_path_saga_rejects_out_of_range_frame(current_frame: int) -> None:
     assert transactions == {}
 
 
+def test_mow_path_saga_rejects_packets_outside_requested_manifest() -> None:
+    """A stale cover-path packet cannot be labelled as the new route."""
+    transactions: dict[int, dict[int, MowPath]] = {}
+    frame = MowPath(
+        transaction_id=20,
+        current_frame=1,
+        total_frame=1,
+        path_packets=[MowPathPacket(path_hash=999)],
+    )
+
+    with pytest.raises(SagaFailedError):
+        MowPathSaga._store_batch_frame(  # noqa: SLF001
+            transactions,
+            frame,
+            20,
+            {100},
+        )
+
+    assert transactions == {}
+
+
+def test_mow_path_saga_rejects_incomplete_requested_manifest() -> None:
+    """A complete frame set must contain every hash requested in its batch."""
+    transactions: dict[int, dict[int, MowPath]] = {}
+    frame = MowPath(
+        transaction_id=20,
+        current_frame=1,
+        total_frame=1,
+        path_packets=[MowPathPacket(path_hash=100)],
+    )
+
+    with pytest.raises(SagaFailedError):
+        MowPathSaga._store_batch_frame(  # noqa: SLF001
+            transactions,
+            frame,
+            20,
+            {100, 200},
+        )
+
+    assert transactions == {}
+
+
 def test_mow_path_retry_keeps_completed_batches_only() -> None:
     """A retry skips completed hashes while discarding its partial transaction."""
     saga = MowPathSaga(_make_command_builder(), AsyncMock(), HashList, [], skip_planning=False)
@@ -823,17 +867,122 @@ def test_mow_path_retry_keeps_completed_batches_only() -> None:
         20: {1: MowPath(transaction_id=20, current_frame=1, total_frame=1)},
     }
 
-    assert saga._hashes_to_fetch([100, 200]) == [200]  # noqa: SLF001
+    assert saga._hashes_to_fetch([100, 200], HashList()) == [200]  # noqa: SLF001
     assert saga._pending_transactions[20][1].current_frame == 1  # noqa: SLF001
+
+
+def test_forced_mow_path_refresh_ignores_same_session_cache() -> None:
+    """Restored-session verification fetches every current route hash."""
+    current_map = HashList(current_mow_path_session_id=3)
+    current_map.current_mow_path = {
+        20: {
+            1: MowPath(
+                transaction_id=20,
+                current_frame=1,
+                total_frame=1,
+                path_packets=[MowPathPacket(path_hash=100)],
+            )
+        }
+    }
+    saga = MowPathSaga(
+        _make_command_builder(),
+        AsyncMock(),
+        lambda: current_map,
+        [],
+        skip_planning=True,
+        get_mow_session_id=lambda: 3,
+        force_refresh=True,
+    )
+    saga._capture_task_identity()  # noqa: SLF001
+
+    assert saga._hashes_to_fetch([100], current_map) == [100]  # noqa: SLF001
+
+
+def test_mow_path_retry_preserves_initial_session_identity() -> None:
+    """A retry cannot rebind staged route data to a later mowing session."""
+    session_id = 3
+    saga = MowPathSaga(
+        _make_command_builder(),
+        AsyncMock(),
+        HashList,
+        [],
+        get_mow_session_id=lambda: session_id,
+    )
+
+    saga._capture_task_identity()  # noqa: SLF001
+    session_id = 4
+    saga._capture_task_identity()  # noqa: SLF001
+
+    assert saga.started_session_id == 3
+    assert saga.result_session_id == 4
+
+
+def test_running_mow_path_retry_preserves_initial_session_identity() -> None:
+    """Fetch-only recovery keeps the session bound at its first dispatch."""
+    session_id = 3
+    saga = MowPathSaga(
+        _make_command_builder(),
+        AsyncMock(),
+        HashList,
+        [],
+        skip_planning=True,
+        get_mow_session_id=lambda: session_id,
+    )
+
+    saga._capture_task_identity()  # noqa: SLF001
+    session_id = 4
+    saga._capture_task_identity()  # noqa: SLF001
+
+    assert saga.started_session_id == 3
+    assert saga.result_session_id == 3
+
+
+async def test_mow_path_manifest_does_not_fall_back_to_cached_session() -> None:
+    """An empty device reply cannot bind an earlier manifest to this session."""
+    hash_list = HashList()
+    hash_list.root_hash_lists = [
+        RootHashList(
+            total_frame=1,
+            sub_cmd=3,
+            data=[
+                NavGetHashListData(
+                    sub_cmd=3,
+                    total_frame=1,
+                    current_frame=1,
+                    data_couple=[100],
+                )
+            ],
+        )
+    ]
+    saga = MowPathSaga(
+        _make_command_builder(),
+        AsyncMock(),
+        lambda: hash_list,
+        [],
+        skip_planning=True,
+        get_mow_session_id=lambda: 4,
+    )
+    saga._send_ble_sync = AsyncMock()  # type: ignore[method-assign]  # noqa: SLF001
+    saga._collect_frames = MagicMock(  # type: ignore[method-assign]  # noqa: SLF001
+        return_value=nullcontext(AsyncMock())
+    )
+
+    with patch(
+        "pymammotion.messaging.mow_path_saga.ack_stream",
+        new=AsyncMock(return_value={}),
+    ):
+        manifest = await saga._fetch_line_hash_list(AsyncMock())  # noqa: SLF001
+
+    assert manifest == RootHashList(sub_cmd=3)
 
 
 async def test_mow_path_saga_preserves_current_mow_path_across_runs() -> None:
     """current_mow_path must NOT be wiped at the start of each _run() call.
 
     Wiping on retry defeats the per-hash skip logic that lets the saga avoid
-    re-fetching cover-path data already cached from prior frames.  Stale entries
-    are cleared by ``HashList.invalidate_mow_path()`` only when the device
-    reports ``path_hash`` 0 or 1 (job ended), mirroring the APK's HashDataManager.
+    re-fetching cover-path data already cached from prior frames. Entries remain
+    cached until ``HashList.clear_mow_path()`` is called for a new mowing
+    session.
     """
     hash_list = HashList()
     stale_tx = {99999: {1: MowPath(total_frame=3, current_frame=1, transaction_id=99999)}}
@@ -863,8 +1012,8 @@ async def test_mow_path_saga_preserves_current_mow_path_across_runs() -> None:
     # The saga itself must leave stale entries alone — per-hash skip relies on this.
     assert hash_list.current_mow_path == stale_tx
 
-    # Only invalidate_mow_path(0) clears it (job ended → cache flush).
-    hash_list.invalidate_mow_path(0)
+    # Only an explicit new-session clear removes the cache.
+    hash_list.clear_mow_path()
     assert hash_list.current_mow_path == {}
 
 
@@ -889,18 +1038,15 @@ async def test_mow_path_saga_syncs_before_route_and_line_info() -> None:
     ]
 
     broker = AsyncMock(spec=DeviceMessageBroker)
-    subscribe_side_effect, active_callbacks = _make_subscribe_ctx()
+    subscribe_side_effect, _active_callbacks = _make_subscribe_ctx()
     broker.subscribe_unsolicited.side_effect = subscribe_side_effect
 
     # Route response returned by the (mocked) send_and_wait for step 2.
     route_val = MagicMock(sub_cmd=0, path_hash=0)
     route_response = MagicMock()
     route_response.nav.bidire_reqconver_path = route_val
+    route_response.nav._leaf_name = "bidire_reqconver_path"
     broker.send_and_wait.return_value = route_response
-
-    # Step-1 hash frame (sub_cmd=3, single frame) fed when the line-hash-list request is sent.
-    hash_frame = MagicMock()
-    hash_frame.nav.toapp_gethash_ack = MagicMock(sub_cmd=3, current_frame=1, total_frame=1)
 
     cb = MagicMock()
     cb.send_todev_ble_sync.return_value = b"ble_sync"
@@ -909,20 +1055,13 @@ async def test_mow_path_saga_syncs_before_route_and_line_info() -> None:
     cb.generate_route_information.return_value = b"route_cmd"
     cb.get_line_info_list.side_effect = _StopAfterLineInfo  # halt once the cover-path request fires
 
-    async def send_command(cmd: bytes) -> None:
-        if cmd == b"hash_list_cmd" and active_callbacks:
-            await active_callbacks[-1](hash_frame)
+    async def send_command(_cmd: bytes) -> None:
+        return None
 
-    def _which(obj: Any, group: str) -> tuple[str, Any]:
-        if group == "LubaSubMsg":
-            return ("nav", obj.nav)
-        # SubNavMsg: the route response carries an int sub_cmd on bidire_reqconver_path.
-        bidire = getattr(obj, "bidire_reqconver_path", None)
-        if isinstance(getattr(bidire, "sub_cmd", None), int):
-            return ("bidire_reqconver_path", bidire)
-        return ("toapp_gethash_ack", obj.toapp_gethash_ack)
-
-    with patch("betterproto2.which_one_of", side_effect=_which), patch("asyncio.sleep", new_callable=AsyncMock):
+    with patch(
+        "betterproto2.which_one_of",
+        side_effect=_which_one_of_for_hash,
+    ), patch("asyncio.sleep", new_callable=AsyncMock):
         saga = MowPathSaga(
             command_builder=cb,
             send_command=send_command,
@@ -932,6 +1071,26 @@ async def test_mow_path_saga_syncs_before_route_and_line_info() -> None:
             sync_type=2,  # BLE
         )
         saga.step_timeout = 0.01
+
+        async def fetch_manifest(
+            _broker: DeviceMessageBroker,
+        ) -> RootHashList:
+            await saga._send_ble_sync()  # noqa: SLF001
+            cb.get_all_boundary_hash_list(sub_cmd=3)
+            return RootHashList(
+                total_frame=1,
+                sub_cmd=3,
+                data=[
+                    NavGetHashListData(
+                        sub_cmd=3,
+                        total_frame=1,
+                        current_frame=1,
+                        data_couple=[100],
+                    )
+                ],
+            )
+
+        saga._fetch_line_hash_list = fetch_manifest  # type: ignore[method-assign]
         with pytest.raises(_StopAfterLineInfo):
             await saga.execute(broker)
 
@@ -955,6 +1114,7 @@ async def test_mow_path_saga_syncs_before_route_and_line_info() -> None:
     assert route_idx < manifest_idx, f"route manifest requested before route generation: {names}"
 
     line_idx = names.index("get_line_info_list")
+    assert manifest_idx < line_idx
     assert names[line_idx - 1] == "send_todev_ble_sync", f"no sync before cover-path: {names[: line_idx + 1]}"
 
     cb.send_todev_ble_sync.assert_called_with(sync_type=2)
