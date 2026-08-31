@@ -399,6 +399,8 @@ class MowerDevice(Device):
                 self.map.planned_mow_path_pending = False
             else:
                 self.map.clear_mow_path()
+            if self.map.dynamics_line and self.map.dynamics_line_session_id != self.mow_session_id:
+                self.map.clear_dynamics_line()
 
         if toapp_report_data.work is not None:
             if not is_actively_mowing:

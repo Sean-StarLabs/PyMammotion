@@ -18,6 +18,7 @@ import json
 
 from pymammotion.data.model.hash_list import (
     AreaHashNameList,
+    CommDataCouple,
     FrameList,
     HashList,
     NavGetCommData,
@@ -27,6 +28,7 @@ from pymammotion.data.model.hash_list import (
     PathType,
     RootHashList,
 )
+from pymammotion.data.model.location import LocationPoint
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +199,29 @@ def test_clear_mow_path_resets_session_bound_state() -> None:
     assert hash_list.generated_mow_path_geojson == {}
     assert hash_list.generated_mow_progress_geojson == {}
     assert [root.sub_cmd for root in hash_list.root_hash_lists] == [0]
+
+
+def test_update_dynamics_line_records_mow_session() -> None:
+    """Live route geometry remains associated with the session that supplied it."""
+    hash_list = HashList()
+
+    hash_list.update_dynamics_line([], session_id=3)
+
+    assert hash_list.dynamics_line_session_id == 3
+    restored = HashList.from_dict(hash_list.to_dict())
+    assert restored.dynamics_line_session_id == 3
+
+
+def test_short_dynamics_line_clears_derived_geojson() -> None:
+    """A successful empty or one-point replacement removes stale geometry."""
+    for points in ([], [CommDataCouple(x=1, y=2)]):
+        hash_list = HashList()
+        hash_list.dynamics_line = points
+        hash_list.generated_dynamics_line_geojson = {"type": "Feature"}
+
+        hash_list.apply_dynamics_line_geojson(LocationPoint(latitude=1.0, longitude=1.0))
+
+        assert hash_list.generated_dynamics_line_geojson == {}
 
 
 # ---------------------------------------------------------------------------
