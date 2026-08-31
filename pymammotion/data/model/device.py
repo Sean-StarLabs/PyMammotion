@@ -241,6 +241,10 @@ class MowerDevice(Device):
     non_work_hours: DeviceNonWorkingHours = field(default_factory=DeviceNonWorkingHours)
     events: Events = field(default_factory=Events)
     work_session_result: WorkSessionResult = field(default_factory=WorkSessionResult)
+    #: Locally assigned identity for the reported mowing-job lifecycle. The
+    #: device's path hashes identify route segments and can change many times
+    #: within one job, so they cannot safely own cached native geometry.
+    mow_session_id: int = 0
 
     @property
     def device_limits(self) -> DeviceLimits:
@@ -363,23 +367,60 @@ class MowerDevice(Device):
         if toapp_report_data.fw_info:
             self.update_device_firmwares(toapp_report_data.fw_info)
 
-        if toapp_report_data.work:
-            # A mid-mow restart can produce path_hash=0/1 or ub_path_hash=0 in
-            # the first report before the device re-reports its active hashes.
-            # Guard all state-clearing operations so a transient zero doesn't
-            # wipe live mow data (cover path, zone list, GeoJSON) mid-job.
-            sys_status = toapp_report_data.dev.sys_status if toapp_report_data.dev else 0
-            is_actively_mowing = sys_status in MOWING_ACTIVE_MODES
+        previous_path_hash = int(self.report_data.work.path_hash)
+        previous_sys_status = self.report_data.dev.sys_status
+        was_actively_mowing = previous_sys_status in MOWING_ACTIVE_MODES
+        incoming_status = toapp_report_data.dev.sys_status if toapp_report_data.dev else 0
+        status_is_complete = (
+            toapp_report_data.dev is not None
+            and toapp_report_data.work is not None
+            and (incoming_status != 0 or toapp_report_data.dev.sys_time_stamp != 0)
+        )
+        reported_status = incoming_status if incoming_status or status_is_complete else previous_sys_status
+        is_actively_mowing = reported_status in MOWING_ACTIVE_MODES
+
+        starts_mow_session = (
+            not was_actively_mowing and is_actively_mowing and reported_status != WorkMode.MODE_RETURNING
+        ) or (
+            self.mow_session_id == 0
+            and reported_status
+            in {
+                WorkMode.MODE_WORKING,
+                WorkMode.MODE_PAUSE,
+                WorkMode.MODE_CHARGING_PAUSE,
+            }
+        )
+        if starts_mow_session:
+            self.mow_session_id += 1
+            if (
+                self.map.current_mow_path
+                and self.map.current_mow_path_session_id == self.mow_session_id
+            ):
+                self.map.planned_mow_path_pending = False
+            else:
+                self.map.clear_mow_path()
+
+        if toapp_report_data.work is not None:
             if not is_actively_mowing:
                 if (toapp_report_data.work.area >> 16) == 0 and toapp_report_data.work.ub_path_hash == 0:
                     self.work.zone_hashs = []
                     self.events.work_tasks_event.hash_area_map = {}
                     self.events.work_tasks_event.ids = []
                     self.map.invalidate_breakpoint_line(0)
-                self.map.invalidate_mow_path(toapp_report_data.work.path_hash)
             self.map.invalidate_breakpoint_line(toapp_report_data.work.ub_path_hash)
 
         self.report_data.update(toapp_report_data)
+        if toapp_report_data.dev is not None and toapp_report_data.dev.sys_status == 0 and not status_is_complete:
+            self.report_data.dev.sys_status = previous_sys_status
+        if (
+            toapp_report_data.work is not None
+            and was_actively_mowing
+            and is_actively_mowing
+            and self.report_data.work.path_hash in (0, 1)
+            and previous_path_hash not in (0, 1)
+        ):
+            # Active devices transiently report end sentinels while reconnecting.
+            self.report_data.work.path_hash = previous_path_hash
 
     def run_state_update(self, tard_state: SystemTardStateTunnelMsg) -> None:
         """Set lat long, work zone of RTK and robot."""

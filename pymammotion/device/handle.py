@@ -324,6 +324,11 @@ class DeviceHandle:
         # EventBus awaits subscribers inline. Track inbound dispatch tasks so a
         # subscriber cannot deadlock the receive loop by awaiting another frame.
         self._inbound_dispatch_tasks: set[asyncio.Task[object]] = set()
+        # A restored active session may belong to a later job if the process
+        # missed a complete stop/start cycle. Keep its cached route visible until
+        # a fresh complete report lets the client replace it from the device.
+        self._restored_mow_path_session_id: int | None = None
+        self._restored_mow_path_verification_ready = False
         self._last_route_transaction_id = 0
         # Wire up critical error propagation from queue
         self.queue.on_critical_error = self._on_critical_error
@@ -687,7 +692,34 @@ class DeviceHandle:
             self._last_report_data_at = time.monotonic()
             self._report_data_generation += 1
             self._report_data_event.set()
-        if changed:
+        force_verification_event = False
+        report_data = (
+            luba_msg.sys.toapp_report_data if luba_msg.sys is not None else None
+        )
+        report_is_complete = (
+            report_data is not None
+            and report_data.dev is not None
+            and report_data.work is not None
+            and (
+                report_data.dev.sys_status != 0
+                or report_data.dev.sys_time_stamp != 0
+            )
+        )
+        if report_is_complete and self._restored_mow_path_session_id is not None:
+            current = snapshot.raw
+            if (
+                not isinstance(current, MowerDevice)
+                or current.mow_session_id != self._restored_mow_path_session_id
+                or current.report_data.dev.sys_status not in MOWING_ACTIVE_MODES
+                or not current.map.has_mow_path_for_session(
+                    self._restored_mow_path_session_id
+                )
+            ):
+                self.clear_restored_mow_path_verification()
+            else:
+                self._restored_mow_path_verification_ready = True
+                force_verification_event = True
+        if changed or force_verification_event:
             await self.emit_state_changed(snapshot)
 
         # 6. Emit map_updated when the area set HA renders changes:
@@ -900,13 +932,18 @@ class DeviceHandle:
     async def commit_mow_path_transactions(
         self,
         transactions: dict[int, dict[int, MowPath]],
+        session_id: int = 0,
         *,
+        validate_current_session: bool = True,
         replace: bool = False,
         line_hash_list: RootHashList | None = None,
+        clear_dynamics_line: bool = False,
     ) -> bool:
         """Commit complete cover-path data through the device state pipeline."""
         current = self.state_machine.current.raw
         if not isinstance(current, MowerDevice):
+            return False
+        if validate_current_session and session_id and current.mow_session_id != session_id:
             return False
         updated = dataclasses.replace(current)
         updated.map = copy.deepcopy(current.map)
@@ -916,7 +953,14 @@ class DeviceHandle:
             ]
             if line_hash_list.data:
                 updated.map.root_hash_lists.append(line_hash_list)
-        updated.map.commit_mow_path_transactions(transactions, replace=replace)
+        updated.map.commit_mow_path_transactions(
+            transactions,
+            session_id,
+            replace=replace,
+        )
+        if clear_dynamics_line:
+            updated.map.update_dynamics_line([])
+            updated.map.generated_dynamics_line_geojson = {}
         if updated.location.RTK.latitude != 0.0:
             updated.map.generate_mowing_geojson(updated.location.RTK)
         snapshot, _ = self.state_machine.apply(updated, self._availability)
@@ -1002,7 +1046,36 @@ class DeviceHandle:
 
     def restore_device(self, device: Device) -> None:
         """Restore previously saved device state (e.g. from HA storage)."""
+        if (
+            isinstance(device, MowerDevice)
+            and device.mow_session_id > 0
+            and device.report_data.dev.sys_status in MOWING_ACTIVE_MODES
+            and device.map.has_mow_path_for_session(device.mow_session_id)
+        ):
+            self._restored_mow_path_session_id = device.mow_session_id
+        else:
+            self._restored_mow_path_session_id = None
+        self._restored_mow_path_verification_ready = False
         self.state_machine.restore(device)
+
+    @property
+    def restored_mow_path_verification_session_id(self) -> int | None:
+        """Return the restored session whose cached route needs verification."""
+        if not self._restored_mow_path_verification_ready:
+            return None
+        return self._restored_mow_path_session_id
+
+    def clear_restored_mow_path_verification(
+        self, session_id: int | None = None
+    ) -> None:
+        """Clear restored-route verification for the expected session."""
+        if (
+            session_id is not None
+            and self._restored_mow_path_session_id != session_id
+        ):
+            return
+        self._restored_mow_path_session_id = None
+        self._restored_mow_path_verification_ready = False
 
     def subscribe_state_changed(
         self,
