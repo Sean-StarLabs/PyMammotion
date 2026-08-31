@@ -33,9 +33,9 @@ class CommonDataSaga(Saga):
     3. Stops once ``current_frame == total_frame`` for all collected frames.
     4. Assembles frames in ascending frame-number order into ``self.result``.
 
-    Frame 1 of a dynamics-line response signals a new mowing session on the
-    device; the caller (``MammotionClient.get_dynamics_line``) replaces the
-    stored ``device.map.dynamics_line`` list with the assembled result.
+    Dynamics-line frames remain private while the saga runs; the caller
+    publishes the assembled result through ``DeviceHandle`` only if the same
+    reported task is still active.
 
     Attributes:
         result: Assembled list of ``CommDataCouple`` points from all frames,
@@ -77,11 +77,20 @@ class CommonDataSaga(Saga):
         self._hash_num = hash_num
         self.result: list[CommDataCouple] = []
 
+    def _matches_frame(self, frame: Any) -> bool:
+        """Return whether a response matches this common-data request."""
+        return (
+            frame.result == 0
+            and frame.action == self._action
+            and frame.type == self._type
+            and self._hash_num in (0, frame.hash)
+        )
+
     async def _run(self, broker: DeviceMessageBroker) -> None:
         """Execute the saga.  Clears partial state at the start of each attempt."""
         self.result = []
 
-        with self._collect_frames(broker, "toapp_get_commondata_ack", lambda v: v.type == self._type) as frame_queue:
+        with self._collect_frames(broker, "toapp_get_commondata_ack", self._matches_frame) as frame_queue:
             cmd = self._command_builder.get_common_data(action=self._action, type=self._type, hash_num=self._hash_num)
             await self._send_command(cmd)
 
