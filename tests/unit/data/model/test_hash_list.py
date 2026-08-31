@@ -18,6 +18,7 @@ import json
 
 from pymammotion.data.model.hash_list import (
     AreaHashNameList,
+    CommDataCouple,
     FrameList,
     HashList,
     NavGetCommData,
@@ -26,6 +27,7 @@ from pymammotion.data.model.hash_list import (
     MowPath,
     PathType,
 )
+from pymammotion.data.model.location import LocationPoint
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +211,29 @@ def test_end_sentinel_invalidates_task_bound_mow_path() -> None:
     assert hash_list.planned_mow_path_pending is False
     assert hash_list.generated_mow_path_geojson == {}
     assert hash_list.generated_mow_progress_geojson == {}
+
+
+def test_update_dynamics_line_records_reported_task() -> None:
+    """Live route geometry remains associated with the task that supplied it."""
+    hash_list = HashList()
+
+    hash_list.update_dynamics_line([], path_hash=123)
+
+    assert hash_list.dynamics_line_path_hash == 123
+    restored = HashList.from_dict(hash_list.to_dict())
+    assert restored.dynamics_line_path_hash == 123
+
+
+def test_short_dynamics_line_clears_derived_geojson() -> None:
+    """A successful empty or one-point replacement removes stale geometry."""
+    for points in ([], [CommDataCouple(x=1, y=2)]):
+        hash_list = HashList()
+        hash_list.dynamics_line = points
+        hash_list.generated_dynamics_line_geojson = {"type": "Feature"}
+
+        hash_list.apply_dynamics_line_geojson(LocationPoint(latitude=1.0, longitude=1.0))
+
+        assert hash_list.generated_dynamics_line_geojson == {}
 
 
 # ---------------------------------------------------------------------------

@@ -92,7 +92,7 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
     from pymammotion.data.model.device import Device, MowingDevice
-    from pymammotion.data.model.hash_list import MowPath
+    from pymammotion.data.model.hash_list import CommDataCouple, MowPath
     from pymammotion.data.mqtt.event import ThingEventMessage
     from pymammotion.data.mqtt.properties import MammotionPropertiesMessage, ThingPropertiesMessage
     from pymammotion.data.mqtt.status import ThingStatusMessage
@@ -932,6 +932,21 @@ class DeviceHandle:
         snapshot, _ = self.state_machine.apply(updated, self._availability)
         await self.emit_state_changed(snapshot)
         return True
+
+    async def commit_dynamics_line(self, points: list[CommDataCouple], path_hash: int) -> bool:
+        """Publish a complete live route if its reported task is still active."""
+        current = self.state_machine.current.raw
+        if not isinstance(current, MowerDevice):
+            return False
+        updated = dataclasses.replace(current)
+        updated.map = copy.deepcopy(current.map)
+        accepted = updated.report_data.work.task_path_hash == path_hash
+        if accepted:
+            updated.map.update_dynamics_line(points, path_hash)
+            updated.map.apply_dynamics_line_geojson(updated.location.RTK)
+            snapshot, _ = self.state_machine.apply(updated, self._availability)
+            await self.emit_state_changed(snapshot)
+        return accepted
 
     def has_queued_commands(self) -> bool:
         """Return True if the queue has pending work or a saga is active."""

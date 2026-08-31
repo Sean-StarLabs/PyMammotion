@@ -56,14 +56,13 @@ from pymammotion.auth.token_manager import MQTTCredentials, TokenManager
 from pymammotion.bluetooth.manager import BLETransportManager
 from pymammotion.data.model import GenerateRouteInformation
 from pymammotion.data.model.device import MowerDevice, MowingDevice, RTKBaseStationDevice, create_device
-from pymammotion.data.model.hash_list import PathType
 from pymammotion.data.mqtt.status import StatusType
 from pymammotion.device.handle import DeviceHandle, DeviceRegistry
 from pymammotion.device.readiness import get_readiness_checker
 from pymammotion.http.http import MammotionHTTP
 from pymammotion.http.model.http import CheckDeviceVersion, DeviceRecord, MQTTConnection, UnauthorizedExceptionError
 from pymammotion.messaging.command_queue import Priority
-from pymammotion.messaging.common_data_saga import CommonDataSaga
+from pymammotion.messaging.dynamics_line_saga import DynamicsLineSaga
 from pymammotion.messaging.edge_saga import EdgeMappingSaga
 from pymammotion.messaging.map_saga import MapFetchSaga
 from pymammotion.messaging.mow_path_saga import MowPathSaga
@@ -2429,7 +2428,7 @@ class MammotionClient:
             await handle.enqueue_saga(saga, on_complete=_on_mow_path_complete)
 
     async def get_dynamics_line(self, device_name: str) -> None:
-        """Fetch the live mow-progress path for *device_name* via a CommonDataSaga.
+        """Fetch the live mow-progress path for *device_name* transactionally.
 
         Sends ``NavGetCommData(action=8, type=18)`` to the device and collects
         the multi-frame ``toapp_get_commondata_ack`` response.  On completion the
@@ -2451,18 +2450,19 @@ class MammotionClient:
             _logger.warning("get_dynamics_line: device '%s' not registered", device_name)
             return
 
-        saga = CommonDataSaga(
+        def _task_path_hash() -> int:
+            device = handle.snapshot.raw
+            return device.report_data.work.task_path_hash if isinstance(device, MowerDevice) else 0
+
+        saga = DynamicsLineSaga(
             command_builder=handle.commands,
             send_command=handle.send_raw,
-            action=8,
-            type=PathType.DYNAMICS_LINE,
+            get_task_path_hash=_task_path_hash,
         )
 
         async def _on_complete() -> None:
-            device = self.get_device_by_name(device_name)
-            if device is not None and saga.result:
-                device.map.update_dynamics_line(saga.result)
-                device.map.apply_dynamics_line_geojson(device.location.RTK)
+            if saga.transfer_complete:
+                await handle.commit_dynamics_line(saga.result, saga.task_path_hash)
 
         await handle.enqueue_saga(saga, on_complete=_on_complete)
 
