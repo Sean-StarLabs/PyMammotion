@@ -1822,11 +1822,11 @@ class DeviceHandle:
 
     @property
     def mow_path_fetch_enabled(self) -> bool:
-        """True if MowPathSaga is allowed to run over MQTT."""
+        """True if native mow-path fetching is enabled."""
         return self._mow_path_fetch_enabled
 
     def set_mow_path_fetch_enabled(self, *, value: bool) -> None:
-        """Gate MowPathSaga fetches over MQTT. BLE fetches are never gated."""
+        """Enable or disable native mow-path fetching on every transport."""
         self._mow_path_fetch_enabled = value
 
     @property
