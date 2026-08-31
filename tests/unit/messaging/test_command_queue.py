@@ -1,4 +1,5 @@
 """Tests for DeviceCommandQueue."""
+
 from __future__ import annotations
 
 import asyncio
@@ -178,4 +179,28 @@ async def test_fifo_within_same_priority() -> None:
 
     await asyncio.sleep(0.1)
     assert order == [0, 1, 2]
+    await q.stop()
+
+
+async def test_dedup_key_is_released_when_work_starts() -> None:
+    """A new trigger can queue after the first item has been dequeued."""
+    q = DeviceCommandQueue()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def work() -> None:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+
+    q.start()
+    await q.enqueue(work, dedup_key="refresh")
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    await q.enqueue(work, dedup_key="refresh")
+    release.set()
+    await asyncio.sleep(0.05)
+
+    assert calls == 2
     await q.stop()
