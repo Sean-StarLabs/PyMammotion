@@ -92,7 +92,7 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
     from pymammotion.data.model.device import Device, MowingDevice
-    from pymammotion.data.model.hash_list import CommDataCouple, MowPath
+    from pymammotion.data.model.hash_list import CommDataCouple, MowPath, RootHashList
     from pymammotion.data.mqtt.event import ThingEventMessage
     from pymammotion.data.mqtt.properties import MammotionPropertiesMessage, ThingPropertiesMessage
     from pymammotion.data.mqtt.status import ThingStatusMessage
@@ -912,6 +912,7 @@ class DeviceHandle:
         validate_current_task: bool = True,
         replace: bool = False,
         planned_from_path_hash: int = 0,
+        line_hash_list: RootHashList | None = None,
     ) -> bool:
         """Commit complete cover-path data through the device state pipeline."""
         current = self.state_machine.current.raw
@@ -921,6 +922,12 @@ class DeviceHandle:
             return False
         updated = dataclasses.replace(current)
         updated.map = copy.deepcopy(current.map)
+        if line_hash_list is not None:
+            updated.map.root_hash_lists = [
+                root for root in updated.map.root_hash_lists if root.sub_cmd != line_hash_list.sub_cmd
+            ]
+            if line_hash_list.data:
+                updated.map.root_hash_lists.append(line_hash_list)
         updated.map.commit_mow_path_transactions(
             transactions,
             path_hash,
@@ -947,6 +954,10 @@ class DeviceHandle:
             snapshot, _ = self.state_machine.apply(updated, self._availability)
             await self.emit_state_changed(snapshot)
         return accepted
+
+    async def run_after_preempting_reads(self, work: Callable[[], Awaitable[None]]) -> None:
+        """Run a user command atomically after preempting read-only sagas."""
+        await self.queue.run_after_preempting_reads(work)
 
     def has_queued_commands(self) -> bool:
         """Return True if the queue has pending work or a saga is active."""
@@ -1918,7 +1929,13 @@ class DeviceHandle:
                     exc_info=True,
                 )
 
-    async def send_raw(self, payload: bytes, *, prefer_ble: bool | None = None) -> None:
+    async def send_raw(
+        self,
+        payload: bytes,
+        *,
+        prefer_ble: bool | None = None,
+        raise_on_rate_limit: bool = False,
+    ) -> None:
         """Send raw bytes via the best available transport, with BLE fallback on offline."""
         _logger.debug(
             "send_raw '%s': %d bytes prefer_ble=%s transports=%s",
@@ -1965,9 +1982,13 @@ class DeviceHandle:
                 self.device_name,
                 transport.seconds_until_send_available(),
             )
+            if raise_on_rate_limit:
+                raise
         except TooManyRequestsException:
             _logger.warning("send_raw '%s': rate limited by cloud — blocking MQTT sends for 12h", self.device_name)
             transport.set_rate_limited()
+            if raise_on_rate_limit:
+                raise
         except DeviceOfflineException:
             ble = self._on_device_offline(transport)
             if ble is None:

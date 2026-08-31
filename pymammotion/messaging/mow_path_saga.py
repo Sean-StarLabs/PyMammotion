@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import time
 from typing import TYPE_CHECKING, Any
@@ -9,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 import betterproto2
 
 from pymammotion.data.model import GenerateRouteInformation
-from pymammotion.data.model.hash_list import HashList, MowPath
+from pymammotion.data.model.hash_list import HashList, MowPath, NavGetHashListData, RootHashList
 from pymammotion.messaging.saga import Saga
 from pymammotion.messaging.transfers import ack_stream
 from pymammotion.transport.base import CommandTimeoutError, SagaFailedError
@@ -94,6 +95,7 @@ class MowPathSaga(Saga):
         self._zone_hashs = zone_hashs
         self._route_info = route_info
         self._skip_planning = skip_planning
+        self.interruptible = skip_planning
         self._device_name = device_name
         self._sync_type = sync_type  # 2 = BLE, 3 = IoT/MQTT
         self._next_transaction_id = next_transaction_id
@@ -102,6 +104,7 @@ class MowPathSaga(Saga):
         self._completed_hashes: set[int] = set()
         self.result: dict[int, dict[int, MowPath]] = {}
         self.started_path_hash = 0
+        self.result_root_hash_list = RootHashList(sub_cmd=3)
         self.result_path_hash = 0
         self._route_val: GenerateRouteInformation | None = route_info if skip_planning else None
 
@@ -227,6 +230,34 @@ class MowPathSaga(Saga):
                     self._device_name,
                 )
 
+        line_data = [
+            NavGetHashListData(
+                pver=int(frame.pver),
+                sub_cmd=int(frame.sub_cmd),
+                total_frame=int(frame.total_frame),
+                current_frame=int(frame.current_frame),
+                data_hash=int(frame.data_hash),
+                hash_len=int(frame.hash_len),
+                reserved=str(frame.reserved),
+                result=int(frame.result),
+                data_couple=[int(value) for value in frame.data_couple],
+            )
+            for frame in line_frames.values()
+        ]
+        if line_data:
+            self.result_root_hash_list = RootHashList(
+                total_frame=line_data[0].total_frame,
+                sub_cmd=3,
+                data=line_data,
+            )
+        else:
+            previous = next(
+                (root for root in self._get_map().root_hash_lists if root.sub_cmd == 3),
+                None,
+            )
+            if previous is not None:
+                self.result_root_hash_list = copy.deepcopy(previous)
+
         # ------------------------------------------------------------------
         # Step 2: Get route information (skip if already cached from a prior attempt).
         # ------------------------------------------------------------------
@@ -264,16 +295,21 @@ class MowPathSaga(Saga):
         else:
             _logger.debug("MowPathSaga: reusing cached route info — skipping step 2")
 
-        # Use get_map() as the source of truth for the received line hash frames.
-        # Combine all frames' hashes into one flat list, then split into batches of 20.
-        _sub3 = next((r for r in self._get_map().root_hash_lists if r.sub_cmd == 3), None)
-        if _sub3 is None or not _sub3.data:
+        # The manifest is staged locally with the route. Publishing frames through
+        # the reducer would expose a partial manifest when this read is preempted.
+        if not self.result_root_hash_list.data:
             # No breakpoint lines from sub_cmd=3 — nothing to fetch via get_line_info_list.
             _logger.debug("MowPathSaga: no sub_cmd=3 line hashes — no cover path to fetch")
             self._route_val = None
             return
         all_hashes = [
-            h for frame in sorted(_sub3.data, key=lambda d: d.current_frame) for h in frame.data_couple if h != 0
+            h
+            for frame in sorted(
+                self.result_root_hash_list.data,
+                key=lambda data: data.current_frame,
+            )
+            for h in frame.data_couple
+            if h != 0
         ]
         _logger.debug("MowPathSaga: %d total hash(es) from map", len(all_hashes))
 

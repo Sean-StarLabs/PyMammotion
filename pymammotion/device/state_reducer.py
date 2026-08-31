@@ -371,9 +371,12 @@ class MowerStateReducer(StateReducer):
         match nav_msg[0]:
             case "toapp_gethash_ack":
                 hashlist_ack: NavGetHashListAck = nav_msg[1]  # type: ignore
-                device.map.update_root_hash_list(
-                    NavGetHashListData.from_dict(hashlist_ack.to_dict(casing=betterproto2.Casing.SNAKE))
-                )
+                # MowPathSaga stages sub_cmd=3 with its cover-path transactions,
+                # so cancellation cannot publish a partial route manifest.
+                if hashlist_ack.sub_cmd != 3:
+                    device.map.update_root_hash_list(
+                        NavGetHashListData.from_dict(hashlist_ack.to_dict(casing=betterproto2.Casing.SNAKE))
+                    )
             case "toapp_get_commondata_ack":
                 common_data: NavGetCommDataAck = nav_msg[1]  # type: ignore
                 if common_data.type == PathType.DYNAMICS_LINE:

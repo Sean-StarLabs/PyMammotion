@@ -18,10 +18,13 @@ from pymammotion.data.model.hash_list import (
 )
 from pymammotion.data.model import GenerateRouteInformation
 from pymammotion.messaging.broker import CommandTimeoutError, DeviceMessageBroker
+from pymammotion.messaging.common_data_saga import CommonDataSaga
+from pymammotion.messaging.dynamics_line_saga import DynamicsLineSaga
 from pymammotion.messaging.map_saga import MapFetchSaga
 from pymammotion.messaging.mow_path_saga import MowPathSaga
 from pymammotion.messaging.plan_saga import PlanFetchSaga
 from pymammotion.messaging.saga import SagaFailedError
+from pymammotion.messaging.spino_plan_saga import SpinoPlanFetchSaga
 
 
 # ---------------------------------------------------------------------------
@@ -861,6 +864,28 @@ def test_mow_path_retry_keeps_completed_batches_only() -> None:
     assert saga._pending_transactions[20][1].current_frame == 1  # noqa: SLF001
 
 
+def test_only_fetch_only_mow_path_saga_is_interruptible() -> None:
+    """Route planning is a write; fetching an existing route is a read."""
+    common = {
+        "command_builder": _make_command_builder(),
+        "send_command": AsyncMock(),
+        "get_map": HashList,
+        "zone_hashs": [],
+    }
+
+    assert MowPathSaga(**common).interruptible is False
+    assert MowPathSaga(**common, skip_planning=True).interruptible is True
+
+
+def test_only_transactionally_staged_read_sagas_are_interruptible() -> None:
+    """Reads that mutate live reducer state must finish before user commands."""
+    assert MapFetchSaga.interruptible is False
+    assert PlanFetchSaga.interruptible is False
+    assert SpinoPlanFetchSaga.interruptible is False
+    assert CommonDataSaga.interruptible is False
+    assert DynamicsLineSaga.interruptible is True
+
+
 async def test_mow_path_saga_preserves_current_mow_path_across_runs() -> None:
     """current_mow_path must NOT be wiped at the start of each _run() call.
 
@@ -933,8 +958,10 @@ async def test_mow_path_saga_syncs_before_route_and_line_info() -> None:
     broker.send_and_wait.return_value = route_response
 
     # Step-1 hash frame (sub_cmd=3, single frame) fed when the line-hash-list request is sent.
-    hash_frame = MagicMock()
-    hash_frame.nav.toapp_gethash_ack = MagicMock(sub_cmd=3, current_frame=1, total_frame=1)
+    hash_frame = _make_hash_list_ack_response(
+        sub_cmd=3,
+        data_couple=[100],
+    )
 
     cb = MagicMock()
     cb.send_todev_ble_sync.return_value = b"ble_sync"

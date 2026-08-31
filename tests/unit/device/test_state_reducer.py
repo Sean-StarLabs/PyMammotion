@@ -16,6 +16,7 @@ from pymammotion.proto import (
     MctlNav,
     CoverPathUploadT,
     NavGetCommDataAck,
+    NavGetHashListAck,
     NavGetAllPlanTask,
     NavReqCoverPath,
     NavSysParamMsg,
@@ -80,6 +81,26 @@ def test_dynamics_frames_always_remain_private_to_atomic_saga() -> None:
 
     assert updated.map.dynamics_line == current.map.dynamics_line
     assert updated.map.dynamics_line_path_hash == 123
+
+
+def test_route_manifest_frames_remain_private_to_atomic_saga() -> None:
+    """Sub-command 3 hash frames publish only with a complete route."""
+    reducer = MowerStateReducer()
+    current = _make_device()
+    msg = LubaMsg(
+        nav=MctlNav(
+            toapp_gethash_ack=NavGetHashListAck(
+                sub_cmd=3,
+                total_frame=2,
+                current_frame=1,
+                data_couple=[123],
+            )
+        )
+    )
+
+    updated = reducer.apply(current, msg)
+
+    assert updated.map.root_hash_lists == []
 
 
 def test_unable_time_set_only_copies_non_work_hours() -> None:

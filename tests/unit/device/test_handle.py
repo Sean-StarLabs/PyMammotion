@@ -10,7 +10,13 @@ import pytest
 
 from pymammotion.aliyun.exceptions import DeviceOfflineException, DeviceUnboundException
 from pymammotion.data.model.device import MowerDevice
-from pymammotion.data.model.hash_list import CommDataCouple, HashList, MowPath
+from pymammotion.data.model.hash_list import (
+    CommDataCouple,
+    HashList,
+    MowPath,
+    NavGetHashListData,
+    RootHashList,
+)
 from pymammotion.device.handle import DeviceHandle, DeviceRegistry
 from pymammotion.messaging.mow_path_saga import MowPathSaga
 from pymammotion.proto import LubaMsg as RealLubaMsg
@@ -151,6 +157,36 @@ async def test_commit_mow_path_transactions_publishes_new_snapshot() -> None:
     assert retained.raw.map.current_mow_path == {}
     assert handle.snapshot.raw.map.current_mow_path == transactions
     assert emitted
+
+
+async def test_commit_mow_path_transactions_publishes_staged_manifest() -> None:
+    """The route and its complete line-hash manifest become visible together."""
+    handle = DeviceHandle(
+        device_id="dev-route",
+        device_name="Luba-Route",
+        initial_device=MowerDevice(name="Luba-Route"),
+    )
+    transactions = {20: {1: MowPath(transaction_id=20, current_frame=1, total_frame=1)}}
+    manifest = RootHashList(
+        total_frame=1,
+        sub_cmd=3,
+        data=[
+            NavGetHashListData(
+                total_frame=1,
+                current_frame=1,
+                sub_cmd=3,
+                data_couple=[123],
+            )
+        ],
+    )
+
+    await handle.commit_mow_path_transactions(
+        transactions,
+        line_hash_list=manifest,
+    )
+
+    assert handle.snapshot.raw.map.current_mow_path == transactions
+    assert handle.snapshot.raw.map.root_hash_lists == [manifest]
 
 
 async def test_commit_mow_path_transactions_rejects_changed_route() -> None:
@@ -1019,6 +1055,20 @@ async def test_send_raw_blocked_silently_when_already_rate_limited() -> None:
     mqtt.send.assert_not_awaited()
     # set_rate_limited must NOT be called again — the ban is already active.
     mqtt.set_rate_limited.assert_not_called()
+
+
+async def test_send_raw_can_report_rate_limited_send() -> None:
+    """A caller that requires delivery receives the rate-limit failure."""
+    handle = _make_rl_handle()
+    mqtt = _make_mqtt_transport()
+    mqtt.is_rate_limited = True
+    mqtt.is_send_blocked = MagicMock(return_value=True)
+    handle._transports[TransportType.CLOUD_ALIYUN] = mqtt  # noqa: SLF001
+
+    with pytest.raises(TransportRateLimitedError):
+        await handle.send_raw(b"\x00", raise_on_rate_limit=True)
+
+    mqtt.send.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

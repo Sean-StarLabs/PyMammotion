@@ -36,14 +36,16 @@ class Priority(IntEnum):
     # still waits for that saga's work() to return.  True e-stop preemption needs a
     # direct send path, not this queue.
     EMERGENCY = 0  # estop, return-to-dock — never dropped, skips TTL/transport gates
-    EXCLUSIVE = 1  # sagas (map/plan fetch) — holds processor until complete
-    NORMAL = 2  # regular HA commands — waits for exclusive slot
-    BACKGROUND = 3  # low-urgency polling — waits for exclusive slot
+    PREEMPTING = 1  # user command ordered ahead of queued read sagas
+    EXCLUSIVE = 2  # sagas (map/plan fetch) — holds processor until complete
+    NORMAL = 3  # regular HA commands — waits for exclusive slot
+    BACKGROUND = 4  # low-urgency polling — waits for exclusive slot
 
 
 #: Commands that have not been dispatched within this window are silently dropped.
 #: EMERGENCY items (e-stop, return-to-dock) are exempt.
 _COMMAND_TTL = 120.0  # 2 minutes
+_GATEWAY_TIMEOUT_MAX = 3
 
 
 @dataclass(order=True)
@@ -54,6 +56,9 @@ class _QueueItem:
     skip_if_saga_active: bool = field(compare=False, default=False)
     dedup_key: str | None = field(compare=False, default=None)
     enqueued_at: float = field(compare=False, default_factory=time.monotonic)
+    completion: asyncio.Future[None] | None = field(compare=False, default=None)
+    expires: bool = field(compare=False, default=True)
+    invalidate_reads_before_generation: int | None = field(compare=False, default=None)
 
 
 class DeviceCommandQueue:
@@ -79,9 +84,15 @@ class DeviceCommandQueue:
         self._transport_gate.set()  # set = open (no reconnection in progress)
         self._seq = 0
         self._running = False
+        self._accepting_work = True
         self._task: asyncio.Task[None] | None = None
         self._device_name = device_name
         self._pending_dedup_keys: set[str] = set()
+        self._interruptible_generation = 0
+        self._minimum_interruptible_generation = 0
+        self._active_interruptible_task: asyncio.Task[None] | None = None
+        self._active_interruptible_requeue: Callable[[], Awaitable[None]] | None = None
+        self._pending_completions: set[asyncio.Future[None]] = set()
         #: Called on critical errors (AuthError, SagaFailedError) so DeviceHandle can propagate them.
         self.on_critical_error: Callable[[Exception], Awaitable[None]] | None = None
         #: Fired when an exclusive saga is about to start.  Clients use this to pause the
@@ -99,6 +110,7 @@ class DeviceCommandQueue:
     def start(self) -> None:
         """Start the background queue processor task."""
         if self._task is None or self._task.done():
+            self._accepting_work = True
             self._running = True
             self._task = asyncio.get_running_loop().create_task(self._process())
 
@@ -119,9 +131,12 @@ class DeviceCommandQueue:
 
     async def stop(self) -> None:
         """Stop the queue processor and release any held exclusive lock."""
+        self._accepting_work = False
         self._running = False
         self._exclusive_active.set()  # release any waiters
         self._transport_gate.set()  # release any gate-blocked waiters
+        for completion in tuple(self._pending_completions):
+            completion.cancel()
         if self._task is not None and not self._task.done():
             self._task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -135,6 +150,9 @@ class DeviceCommandQueue:
         *,
         skip_if_saga_active: bool = False,
         dedup_key: str | None = None,
+        completion: asyncio.Future[None] | None = None,
+        expires: bool = True,
+        invalidate_reads_before_generation: int | None = None,
     ) -> None:
         """Add work to the queue.
 
@@ -149,6 +167,7 @@ class DeviceCommandQueue:
         # EMERGENCY is never skipped or blocked
         if priority == Priority.EMERGENCY:
             skip_if_saga_active = False
+            expires = False
 
         if skip_if_saga_active and self.is_saga_active and priority > Priority.EXCLUSIVE:
             return
@@ -163,6 +182,9 @@ class DeviceCommandQueue:
             work=work,
             skip_if_saga_active=skip_if_saga_active,
             dedup_key=dedup_key,
+            completion=completion,
+            expires=expires,
+            invalidate_reads_before_generation=invalidate_reads_before_generation,
         )
         if dedup_key is not None:
             self._pending_dedup_keys.add(dedup_key)
@@ -175,19 +197,35 @@ class DeviceCommandQueue:
         on_complete: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         """Enqueue a saga as an exclusive blocking operation."""
+        generation = self._interruptible_generation
 
         async def _run() -> None:
+            if saga.interruptible and generation < self._minimum_interruptible_generation:
+                return
             self._exclusive_active.clear()
             try:
+                if saga.interruptible:
+                    self._active_interruptible_task = asyncio.current_task()
+                    self._active_interruptible_requeue = lambda: self.enqueue_saga(saga, broker, on_complete)
                 if self.on_saga_start is not None:
                     try:
                         await self.on_saga_start()
                     except Exception:
                         _logger.exception("on_saga_start callback failed for saga '%s'", saga.name)
+                if saga.interruptible and generation < self._minimum_interruptible_generation:
+                    return
                 saga.device_name = self._device_name
                 try:
-                    await saga.execute(broker)
+                    saga_task = asyncio.create_task(saga.execute(broker))
+                    await saga_task
                 except asyncio.CancelledError:
+                    if saga.interruptible and self._running:
+                        _logger.debug(
+                            "DeviceCommandQueue[%s]: interrupted read saga '%s'",
+                            self._device_name,
+                            saga.name,
+                        )
+                        return
                     raise
                 except Exception as exc:
                     # GatewayTimeoutException and DeviceOfflineException are
@@ -207,13 +245,101 @@ class DeviceCommandQueue:
                 # Always release the exclusive lock and clear the work-task pointer,
                 # even on cancellation or unhandled exception — otherwise the queue deadlocks.
                 self._exclusive_active.set()
+                if saga.interruptible:
+                    self._active_interruptible_task = None
+                    self._active_interruptible_requeue = None
                 if self.on_saga_end is not None:
                     try:
                         await self.on_saga_end()
                     except Exception:
                         _logger.exception("on_saga_end callback failed for saga '%s'", saga.name)
 
-        await self.enqueue(_run, priority=Priority.EXCLUSIVE)
+        await self.enqueue(_run, priority=Priority.EXCLUSIVE, expires=False)
+
+    async def run_after_preempting_reads(self, work: Callable[[], Awaitable[None]]) -> None:
+        """Run a user command after cancelling or discarding read-only sagas.
+
+        The command is enqueued before the active read is cancelled. It therefore
+        runs after any non-interruptible write already in progress and before reads
+        queued by later polling ticks.
+        """
+        if not self._accepting_work:
+            raise asyncio.CancelledError
+        self._interruptible_generation += 1
+        command_generation = self._interruptible_generation
+        completed: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._pending_completions.add(completed)
+        completed.add_done_callback(self._pending_completions.discard)
+        await self.enqueue(
+            work,
+            priority=Priority.PREEMPTING,
+            completion=completed,
+            invalidate_reads_before_generation=command_generation,
+        )
+        task = self._active_interruptible_task
+        restore_read = None
+        if task is not None and not task.done():
+            restore_read = self._active_interruptible_requeue
+            task.cancel()
+        try:
+            await completed
+        except BaseException:
+            completed.cancel()
+            if restore_read is not None and self._accepting_work:
+                try:
+                    await asyncio.shield(restore_read())
+                except Exception:
+                    _logger.exception(
+                        "DeviceCommandQueue[%s]: failed to restore preempted read saga",
+                        self._device_name,
+                    )
+            raise
+
+    async def _execute_item(self, item: _QueueItem) -> None:
+        """Run one item with retry and completion-cancellation ownership."""
+        for attempt in range(1, _GATEWAY_TIMEOUT_MAX + 1):
+            if item.completion is not None and item.completion.cancelled():
+                raise asyncio.CancelledError
+            try:
+                work_task = asyncio.create_task(item.work())
+
+                def _cancel_work(
+                    completion: asyncio.Future[None],
+                    task: asyncio.Task[None] = work_task,
+                ) -> None:
+                    if completion.cancelled() and not task.done():
+                        task.cancel()
+
+                if item.completion is not None:
+                    item.completion.add_done_callback(_cancel_work)
+                try:
+                    await work_task
+                finally:
+                    if item.completion is not None:
+                        item.completion.remove_done_callback(_cancel_work)
+                if item.invalidate_reads_before_generation is not None:
+                    self._minimum_interruptible_generation = max(
+                        self._minimum_interruptible_generation,
+                        item.invalidate_reads_before_generation,
+                    )
+                if item.completion is not None and not item.completion.done():
+                    item.completion.set_result(None)
+                return
+            except GatewayTimeoutException:
+                if attempt < _GATEWAY_TIMEOUT_MAX:
+                    _logger.warning(
+                        "DeviceCommandQueue[%s]: gateway timeout (attempt %d/%d) — retrying",
+                        self._device_name,
+                        attempt,
+                        _GATEWAY_TIMEOUT_MAX,
+                    )
+                else:
+                    _logger.warning(
+                        "DeviceCommandQueue[%s]: gateway timeout after %d attempts — dropping command",
+                        self._device_name,
+                        attempt,
+                    )
+                    raise
 
     async def _process(self) -> None:
         """Queue processor loop — runs as an asyncio background task."""
@@ -231,6 +357,9 @@ class DeviceCommandQueue:
                 if item.dedup_key is not None:
                     self._pending_dedup_keys.discard(item.dedup_key)
 
+                if item.completion is not None and item.completion.cancelled():
+                    continue
+
                 # Drop commands that have waited longer than _COMMAND_TTL without being
                 # dispatched.  Checked here — before any lock/gate waits — so stale
                 # commands don't execute after a long reconnect or saga pause.
@@ -239,7 +368,7 @@ class DeviceCommandQueue:
                 # multi-minute saga ahead of it, and silently dropping it means
                 # on_complete never fires and nothing upstream learns the sync
                 # didn't happen.
-                if item.priority > Priority.EXCLUSIVE:
+                if item.expires:
                     age = time.monotonic() - item.enqueued_at
                     if age > _COMMAND_TTL:
                         _logger.debug(
@@ -247,6 +376,8 @@ class DeviceCommandQueue:
                             self._device_name,
                             age,
                         )
+                        if item.completion is not None and not item.completion.done():
+                            item.completion.set_exception(TimeoutError("queued command expired"))
                         continue
 
                 # Non-emergency items yield to an active exclusive op
@@ -263,36 +394,33 @@ class DeviceCommandQueue:
                 # (e-stop, return-to-dock) bypass the gate unconditionally.
                 if item.priority > Priority.EMERGENCY:
                     await self._transport_gate.wait()
+                    if item.completion is not None and item.completion.cancelled():
+                        continue
 
-                _gateway_timeout_max = 3
-                for _attempt in range(1, _gateway_timeout_max + 1):
-                    try:
-                        await item.work()
-                        break  # success — exit retry loop
-                    except GatewayTimeoutException:
-                        if _attempt < _gateway_timeout_max:
-                            _logger.warning(
-                                "DeviceCommandQueue[%s]: gateway timeout (attempt %d/%d) — retrying",
-                                self._device_name,
-                                _attempt,
-                                _gateway_timeout_max,
-                            )
-                        else:
-                            _logger.warning(
-                                "DeviceCommandQueue[%s]: gateway timeout after %d attempts — dropping command",
-                                self._device_name,
-                                _attempt,
-                            )
+                await self._execute_item(item)
             except asyncio.CancelledError:
-                # stop() sets _running=False before cancelling the processor task,
-                # so CancelledError here always means we are shutting down.
-                break
+                if item.completion is not None and not item.completion.done():
+                    item.completion.cancel()
+                current = asyncio.current_task()
+                if not self._running or (current is not None and current.cancelling()):
+                    break
+                # A completion future canceled its active child work. The queue
+                # itself remains healthy and must continue with the next item.
+                continue
             except Exception as exc:
                 # Expected during transport churn — quiet by default.  Recovery
                 # is automatic: mqtt_reported_offline clears on inbound frames,
                 # BLE rearms via the availability listener.  No retry loop or
                 # caller-side gate needed; just don't pollute the log.
-                if isinstance(exc, (NoTransportAvailableError, DeviceOfflineException, DeviceUnboundException)):
+                if isinstance(
+                    exc,
+                    (
+                        GatewayTimeoutException,
+                        NoTransportAvailableError,
+                        DeviceOfflineException,
+                        DeviceUnboundException,
+                    ),
+                ):
                     _logger.debug("DeviceCommandQueue[%s]: %s", self._device_name, exc)
                 elif isinstance(
                     exc,
@@ -312,6 +440,8 @@ class DeviceCommandQueue:
                         await self.on_critical_error(exc)
                     except Exception:
                         _logger.exception("on_critical_error callback failed")
+                if item.completion is not None and not item.completion.done():
+                    item.completion.set_exception(exc)
             finally:
                 with contextlib.suppress(ValueError):
                     self._queue.task_done()
