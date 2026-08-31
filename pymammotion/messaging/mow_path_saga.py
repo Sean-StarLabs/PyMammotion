@@ -55,6 +55,7 @@ class MowPathSaga(Saga):
     #: retransmit was in flight and abandon a run that was about to succeed —
     #: and with ``max_attempts = 1`` there is no retry to cover for it.
     step_timeout = 3.0
+    _last_fallback_transaction_id = 0
 
     def __init__(
         self,
@@ -67,6 +68,8 @@ class MowPathSaga(Saga):
         skip_planning: bool = False,
         device_name: str = "",
         sync_type: int = 3,
+        next_transaction_id: Callable[[], int] | None = None,
+        get_task_path_hash: Callable[[], int] | None = None,
     ) -> None:
         """Initialise the saga.
 
@@ -93,10 +96,14 @@ class MowPathSaga(Saga):
         self._skip_planning = skip_planning
         self._device_name = device_name
         self._sync_type = sync_type  # 2 = BLE, 3 = IoT/MQTT
+        self._next_transaction_id = next_transaction_id
+        self._get_task_path_hash = get_task_path_hash
+        self._pending_transactions: dict[int, dict[int, MowPath]] = {}
+        self._completed_hashes: set[int] = set()
         self.result: dict[int, dict[int, MowPath]] = {}
-        self._route_val: GenerateRouteInformation | None = (
-            route_info  # persists across retries to skip step 2 if already fetched
-        )
+        self.started_path_hash = 0
+        self.result_path_hash = 0
+        self._route_val: GenerateRouteInformation | None = route_info if skip_planning else None
 
     async def progress(self) -> Any:
         """Route resolution plus banked cover-path frames.
@@ -107,8 +114,48 @@ class MowPathSaga(Saga):
         advances, so it cannot refresh the budget on every run the way a flag set
         inside ``_run`` did.
         """
-        frames = sum(len(f) for f in self._get_map().current_mow_path.values())
-        return (self._route_val is not None, frames)
+        return (self._route_val is not None, len(self._completed_hashes))
+
+    def _new_transaction_id(self) -> int:
+        """Return a transaction ID unique within this device command stream."""
+        if self._next_transaction_id is not None:
+            return self._next_transaction_id()
+        transaction_id = max(int(time.time() * 1000), MowPathSaga._last_fallback_transaction_id + 1)
+        MowPathSaga._last_fallback_transaction_id = transaction_id
+        return transaction_id
+
+    def _hashes_to_fetch(self, all_hashes: list[int], current_map: HashList) -> list[int]:
+        """Return the route hashes that must be requested for this operation."""
+        remaining = [path_hash for path_hash in all_hashes if path_hash not in self._completed_hashes]
+        if not self._skip_planning:
+            # A planned route is an authoritative replacement. Reusing packets
+            # from the prior preview would either mix routes or discard the
+            # reused packets when the new result replaces the cache.
+            return remaining
+        return [path_hash for path_hash in remaining if not current_map.has_mow_path_for_hash(path_hash)]
+
+    @staticmethod
+    def _store_batch_frame(
+        transactions: dict[int, dict[int, MowPath]],
+        frame: MowPath,
+        transaction_id: int,
+    ) -> bool:
+        """Store a valid frame and return whether its transaction is complete."""
+        if frame.transaction_id != transaction_id:
+            return False
+        if (
+            frame.result != 0
+            or frame.total_frame <= 0
+            or frame.current_frame <= 0
+            or frame.current_frame > frame.total_frame
+        ):
+            raise SagaFailedError(MowPathSaga.name, MowPathSaga.max_attempts)
+
+        frames = transactions.setdefault(transaction_id, {})
+        if frames and any(existing.total_frame != frame.total_frame for existing in frames.values()):
+            raise SagaFailedError(MowPathSaga.name, MowPathSaga.max_attempts)
+        frames[frame.current_frame] = frame
+        return HashList.mow_path_transaction_complete(frames)
 
     async def _send_ble_sync(self) -> None:
         """Keep the device in its synced/responsive state before a major fetch request.
@@ -125,6 +172,11 @@ class MowPathSaga(Saga):
     async def _run(self, broker: DeviceMessageBroker) -> None:
         """Execute all saga steps."""
         self.result = {}
+        self.started_path_hash = self._get_task_path_hash() if self._get_task_path_hash is not None else 0
+        if self._skip_planning:
+            # A queued recovery may wait behind another saga. Bind its result to
+            # the task active when this saga actually starts, not the earlier API call.
+            self.result_path_hash = self.started_path_hash
         # Do NOT wipe current_mow_path here — invalidate_mow_path() handles
         # clearing the cache when the device reports path_hash 0/1.  Wiping here
         # defeats the per-hash skip logic below and forces a full re-fetch on
@@ -188,6 +240,7 @@ class MowPathSaga(Saga):
                 route_frame = self.extract_nav_frame(response, "bidire_reqconver_path")
                 assert route_frame is not None  # noqa: S101 — send_and_wait already matched this field
                 self._route_val = route_frame[1]
+                self.result_path_hash = int(self._route_val.path_hash)
                 _logger.debug(
                     "MowPathSaga: route confirmed — sub_cmd=%d  path_hash=%d",
                     self._route_val.sub_cmd,
@@ -215,13 +268,18 @@ class MowPathSaga(Saga):
         ]
         _logger.debug("MowPathSaga: %d total hash(es) from map", len(all_hashes))
 
-        # Skip hashes whose cover-path data is already cached in current_mow_path,
-        # matching the APK's getHashLineNew() per-hash DB check (HashDataManager line 470).
+        # Running-task recovery reuses packets already bound to that task,
+        # matching the APK's getHashLineNew() per-hash DB check. Planning must
+        # fetch a complete replacement instead.
         current_map = self._get_map()
-        missing_hashes = [h for h in all_hashes if not current_map.has_mow_path_for_hash(h)]
+        missing_hashes = self._hashes_to_fetch(all_hashes, current_map)
         if not missing_hashes:
             _logger.debug("MowPathSaga: all %d hash(es) already cached — skipping fetch", len(all_hashes))
-            self.result = current_map.current_mow_path
+            self.result = (
+                {**current_map.current_mow_path, **self._pending_transactions}
+                if self._skip_planning
+                else self._pending_transactions
+            )
             return
 
         if len(missing_hashes) < len(all_hashes):
@@ -244,19 +302,13 @@ class MowPathSaga(Saga):
         # Step 3–4: For each batch of up to 20 hashes, request cover paths and
         # collect all cover_path_upload frames before moving to the next batch.
         # ------------------------------------------------------------------
-        current_run_tx_ids: set[int] = set()
-
         _NO_PROGRESS_LIMIT = 10
-
-        def _missing_frame_count() -> int:
-            return sum(len(v) for v in self._get_map().find_missing_mow_path_frames().values())
 
         with self._collect_frames(broker, "cover_path_upload") as path_queue:
             # Re-sync before the cover-path fetch begins — same reasoning as the route step.
             await self._send_ble_sync()
             for batch_idx, batch_hashes in enumerate(hash_batches):
-                transaction_id = int(time.time() * 1000)
-                current_run_tx_ids.add(transaction_id)
+                transaction_id = self._new_transaction_id()
                 _logger.debug(
                     "MowPathSaga: requesting cover path batch %d/%d — transaction_id=%d  hashes=%s",
                     batch_idx + 1,
@@ -271,47 +323,56 @@ class MowPathSaga(Saga):
                 # (duplicates, stale tx, etc.).  Counter resets at the start of each batch so
                 # the first frame of a new batch (which inflates missing as the tx is created)
                 # is never the one that trips the guard.
-                prev_missing = _missing_frame_count()
+                previous_frame_count = 0
                 no_progress = 0
 
-                while True:
-                    frame_response = await self._next_frame(path_queue, "cover_path_upload")
+                try:
+                    while True:
+                        frame_response = await self._next_frame(path_queue, "cover_path_upload")
 
-                    path_frame = self.extract_nav_frame(frame_response, "cover_path_upload")
-                    assert path_frame is not None  # noqa: S101 — the collector already filtered on this field
-                    mow_path = MowPath.from_dict(path_frame[1].to_dict(casing=betterproto2.Casing.SNAKE))
+                        path_frame = self.extract_nav_frame(frame_response, "cover_path_upload")
+                        assert path_frame is not None  # noqa: S101 — the collector already filtered on this field
+                        mow_path = MowPath.from_dict(path_frame[1].to_dict(casing=betterproto2.Casing.SNAKE))
 
-                    if mow_path.transaction_id not in current_run_tx_ids:
+                        if mow_path.transaction_id != transaction_id:
+                            _logger.debug(
+                                "MowPathSaga: dropping residual frame tx=%d (current tx=%d)",
+                                mow_path.transaction_id,
+                                transaction_id,
+                            )
+                            no_progress += 1
+                            if no_progress >= _NO_PROGRESS_LIMIT:
+                                raise CommandTimeoutError("mow_path_stall", no_progress)
+                            continue
+
                         _logger.debug(
-                            "MowPathSaga: dropping residual frame tx=%d (current run tx_ids=%s)",
+                            "MowPathSaga: got cover_path_upload frame %d/%d  tx=%d  batch=%d/%d",
+                            mow_path.current_frame,
+                            mow_path.total_frame,
                             mow_path.transaction_id,
-                            current_run_tx_ids,
+                            batch_idx + 1,
+                            len(hash_batches),
                         )
-                        self._get_map().current_mow_path.pop(mow_path.transaction_id, None)
-                        continue
 
-                    _logger.debug(
-                        "MowPathSaga: got cover_path_upload frame %d/%d  tx=%d  batch=%d/%d",
-                        mow_path.current_frame,
-                        mow_path.total_frame,
-                        mow_path.transaction_id,
-                        batch_idx + 1,
-                        len(hash_batches),
-                    )
+                        complete = self._store_batch_frame(self._pending_transactions, mow_path, transaction_id)
+                        frame_count = len(self._pending_transactions[transaction_id])
+                        if frame_count > previous_frame_count:
+                            no_progress = 0
+                        else:
+                            no_progress += 1
+                            if no_progress >= _NO_PROGRESS_LIMIT:
+                                raise CommandTimeoutError("mow_path_stall", no_progress)
+                        previous_frame_count = frame_count
 
-                    new_missing = _missing_frame_count()
-                    if new_missing < prev_missing:
-                        no_progress = 0
-                    else:
-                        no_progress += 1
-                        if no_progress >= _NO_PROGRESS_LIMIT:
-                            raise CommandTimeoutError("mow_path_stall", no_progress)
-                    prev_missing = new_missing
+                        if complete:
+                            self._completed_hashes.update(batch_hashes)
+                            break
+                except BaseException:
+                    # Only complete transactions survive a whole-saga retry.
+                    self._pending_transactions.pop(transaction_id, None)
+                    raise
 
-                    if not self._get_map().find_missing_mow_path_frames():
-                        break
-
-        self.result = self._get_map().current_mow_path
+        self.result = self._pending_transactions
         total_packets = sum(len(frames) for frames in self.result.values())
         _logger.debug("MowPathSaga: complete — %d transaction(s)  %d total frame(s)", len(self.result), total_packets)
         self._route_val = None

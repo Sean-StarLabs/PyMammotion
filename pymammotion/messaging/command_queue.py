@@ -178,7 +178,6 @@ class DeviceCommandQueue:
 
         async def _run() -> None:
             self._exclusive_active.clear()
-            saga_exception: BaseException | None = None
             try:
                 if self.on_saga_start is not None:
                     try:
@@ -189,10 +188,8 @@ class DeviceCommandQueue:
                 try:
                     await saga.execute(broker)
                 except asyncio.CancelledError:
-                    saga_exception = asyncio.CancelledError()
                     raise
                 except Exception as exc:
-                    saga_exception = exc
                     # GatewayTimeoutException and DeviceOfflineException are
                     # expected operational errors handled by the _process retry
                     # loop — logging them here as "unhandled" is misleading noise.
@@ -201,6 +198,11 @@ class DeviceCommandQueue:
                     ):
                         _logger.exception("Saga '%s' raised an unhandled exception", saga.name)
                     raise
+                if on_complete is not None:
+                    try:
+                        await on_complete()
+                    except Exception:
+                        _logger.exception("on_complete callback failed for saga '%s'", saga.name)
             finally:
                 # Always release the exclusive lock and clear the work-task pointer,
                 # even on cancellation or unhandled exception — otherwise the queue deadlocks.
@@ -210,11 +212,6 @@ class DeviceCommandQueue:
                         await self.on_saga_end()
                     except Exception:
                         _logger.exception("on_saga_end callback failed for saga '%s'", saga.name)
-            if saga_exception is None and on_complete is not None:
-                try:
-                    await on_complete()
-                except Exception:
-                    _logger.exception("on_complete callback failed for saga '%s'", saga.name)
 
         await self.enqueue(_run, priority=Priority.EXCLUSIVE)
 

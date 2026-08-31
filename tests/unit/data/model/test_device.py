@@ -5,6 +5,7 @@ import json
 
 from pymammotion.data.model.device import MowingDevice
 from pymammotion.data.model.hash_list import FrameList, HashList, MowPath, NavGetCommData
+from pymammotion.data.model.report_info import WorkData
 
 
 def _make_hash_list_with_int_keys() -> HashList:
@@ -49,6 +50,13 @@ def test_empty_mowing_device_roundtrip() -> None:
     assert json_str
     data = json.loads(json_str)
     assert data["name"] == "empty"
+
+
+def test_work_data_task_path_hash_excludes_segments_and_end_sentinels() -> None:
+    """Only the stable route hash identifies a task."""
+    assert WorkData(path_hash=123, ub_path_hash=456).task_path_hash == 123
+    assert WorkData(path_hash=1, ub_path_hash=456).task_path_hash == 0
+    assert WorkData(path_hash=0, ub_path_hash=789).task_path_hash == 0
 
 
 # ===========================================================================
