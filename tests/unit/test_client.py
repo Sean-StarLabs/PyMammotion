@@ -343,6 +343,22 @@ async def test_start_mow_path_saga_generates_geojson_on_completion() -> None:
     await handle.stop()
 
 
+async def test_start_mow_path_saga_respects_disabled_option_over_ble() -> None:
+    """A disabled path fetch must not run merely because BLE is connected."""
+    client = MammotionClient()
+    handle = await _make_handle_with_transport("dev1", "Luba-Mow")
+    handle.is_transport_connected = MagicMock(return_value=True)  # type: ignore[method-assign]
+    handle.set_mow_path_fetch_enabled(value=False)
+    await client._device_registry.register(handle)
+
+    with patch("pymammotion.client.MowPathSaga") as mock_saga:
+        await client.start_mow_path_saga("Luba-Mow", zone_hashs=[1, 2])
+        await asyncio.sleep(0.05)
+
+    mock_saga.assert_not_called()
+    await handle.stop()
+
+
 async def test_start_map_sync_skips_geojson_when_rtk_zero() -> None:
     """generate_geojson must not be called when RTK location is 0,0 (not yet received)."""
     client = MammotionClient()
