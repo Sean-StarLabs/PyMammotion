@@ -135,3 +135,32 @@ async def test_on_saga_start_cancellation_releases_exclusive_lock() -> None:
         assert q.is_saga_active is False, "exclusive lock not released after on_saga_start cancel"
     finally:
         await q.stop()
+
+
+async def test_saga_ownership_covers_completion_callback() -> None:
+    """Residual frames remain owned until the completion result is published."""
+    q = DeviceCommandQueue(device_name="dev-complete")
+    broker = DeviceMessageBroker()
+    observed: list[bool] = []
+    completed = asyncio.Event()
+
+    class _QuickSaga(Saga):
+        name = "quick"
+
+        async def _run(self, _broker: DeviceMessageBroker) -> None:
+            return None
+
+    async def on_complete() -> None:
+        observed.append(q.is_saga_active)
+        completed.set()
+
+    q.start()
+    try:
+        await q.enqueue_saga(_QuickSaga(), broker, on_complete=on_complete)
+        await asyncio.wait_for(completed.wait(), timeout=2.0)
+        await asyncio.sleep(0)
+
+        assert observed == [True]
+        assert q.is_saga_active is False
+    finally:
+        await q.stop()
