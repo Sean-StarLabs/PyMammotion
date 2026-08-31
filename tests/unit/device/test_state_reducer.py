@@ -17,6 +17,7 @@ from pymammotion.proto import (
     NavGetAllPlanTask,
     NavReqCoverPath,
     NavSysParamMsg,
+    NavTaskCtrlAck,
     NavUnableTimeSet,
 )
 
@@ -95,6 +96,23 @@ def test_bidire_reqconver_path_copies_nothing_but_rebinds_work() -> None:
     # But device.work was rebuilt by the handler and current.work is untouched
     assert updated.work is not original_work
     assert current.work is original_work
+
+
+def test_task_control_ack_does_not_replace_reported_mode() -> None:
+    """Command acknowledgements do not prove the mower reached their nav state."""
+    reducer = MowerStateReducer()
+    current = _make_device()
+    current.report_data.dev.sys_status = 1
+    msg = LubaMsg(
+        nav=MctlNav(
+            todev_taskctrl_ack=NavTaskCtrlAck(action=1, result=0, nav_state=2)
+        )
+    )
+
+    updated = reducer.apply(current, msg)
+
+    assert updated.report_data is current.report_data
+    assert updated.report_data.dev.sys_status == 1
 
 
 
