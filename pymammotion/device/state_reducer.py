@@ -27,7 +27,6 @@ from pymammotion.data.model.device_info import DeviceFirmwares, SideLight
 from pymammotion.data.model.hash_list import (
     AreaHashNameList,
     CommDataCouple,
-    MowPath,
     NavGetCommData,
     NavGetHashListData,
     Plan,
@@ -53,7 +52,6 @@ from pymammotion.proto import (
     AppGetAllAreaHashName,
     AppGetCutterWorkMode,
     AppSetCutterWorkMode,
-    CoverPathUploadT,
     DeviceFwInfo,
     DeviceProductTypeInfoT,
     DrvDevInfoResp,
@@ -111,7 +109,10 @@ class StateReducer(ABC):
     that.
     """
 
-    def __init__(self, is_saga_active: Callable[[], bool] | None = None) -> None:
+    def __init__(
+        self,
+        is_saga_active: Callable[[], bool] | None = None,
+    ) -> None:
         """Initialise the reducer with an optional saga-active predicate.
 
         When the callable returns True, expensive opportunistic work (e.g.
@@ -186,7 +187,6 @@ class MowerStateReducer(StateReducer):
                     case (
                         "toapp_gethash_ack"
                         | "toapp_get_commondata_ack"
-                        | "cover_path_upload"
                         | "todev_planjob_set"
                         | "all_plan_task"
                         | "toapp_svg_msg"
@@ -194,6 +194,8 @@ class MowerStateReducer(StateReducer):
                         | "toapp_edge_points"
                     ):
                         device.map = copy.deepcopy(current.map)
+                    case "cover_path_upload":
+                        pass  # MowPathSaga owns and atomically commits these frames.
                     case "todev_taskctrl_ack":
                         pass  # command acknowledgement; reports own mower state
                     case "bidire_reqconver_path":
@@ -377,10 +379,10 @@ class MowerStateReducer(StateReducer):
                 if not self._is_saga_active() and len(device.map.missing_hashlist(0)) == 0:
                     device.map.generate_geojson(device.location.RTK, device.location.dock)
             case "cover_path_upload":
-                mow_path: CoverPathUploadT = nav_msg[1]  # type: ignore
-                device.map.update_mow_path(MowPath.from_dict(mow_path.to_dict(casing=betterproto2.Casing.SNAKE)))
-                if not self._is_saga_active() and len(device.map.find_missing_mow_path_frames()) == 0:
-                    device.map.generate_mowing_geojson(device.location.RTK)
+                # Broker subscribers receive the frame before reduction.
+                # MowPathSaga stages it and publishes only complete transfers;
+                # unsolicited or delayed frames must never mutate live state.
+                pass
             case "todev_planjob_set":
                 planjob: NavPlanJobSet = nav_msg[1]  # type: ignore
                 device.map.update_plan(Plan.from_dict(planjob.to_dict(casing=betterproto2.Casing.SNAKE)))
@@ -1458,7 +1460,10 @@ class RTKStateReducer(StateReducer):
         return device
 
 
-def get_state_reducer(device_name: str, is_saga_active: Callable[[], bool] | None = None) -> StateReducer:
+def get_state_reducer(
+    device_name: str,
+    is_saga_active: Callable[[], bool] | None = None,
+) -> StateReducer:
     """Return the appropriate :class:`StateReducer` for *device_name*.
 
     Dispatches to:

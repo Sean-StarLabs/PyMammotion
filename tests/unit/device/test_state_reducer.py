@@ -9,11 +9,12 @@ be distinct instances so mutations through one do not leak to the other.
 from __future__ import annotations
 
 from pymammotion.data.model.device import MowerDevice
-from pymammotion.data.model.hash_list import AreaHashNameList
+from pymammotion.data.model.hash_list import AreaHashNameList, MowPath
 from pymammotion.device.state_reducer import MowerStateReducer
 from pymammotion.proto import (
     LubaMsg,
     MctlNav,
+    CoverPathUploadT,
     NavGetAllPlanTask,
     NavReqCoverPath,
     NavSysParamMsg,
@@ -113,6 +114,47 @@ def test_task_control_ack_does_not_replace_reported_mode() -> None:
 
     assert updated.report_data is current.report_data
     assert updated.report_data.dev.sys_status == 1
+
+
+def test_cover_path_saga_keeps_partial_frames_out_of_device_state() -> None:
+    """The atomic saga owns cover-path frames until it commits a complete transfer."""
+    reducer = MowerStateReducer()
+    current = _make_device()
+    current.map.current_mow_path = {10: {1: MowPath(transaction_id=10, current_frame=1, total_frame=1)}}
+    msg = LubaMsg(
+        nav=MctlNav(
+            cover_path_upload=CoverPathUploadT(
+                transaction_id=20,
+                current_frame=1,
+                total_frame=2,
+            )
+        )
+    )
+
+    updated = reducer.apply(current, msg)
+
+    assert updated.map is current.map
+    assert 20 not in updated.map.current_mow_path
+
+
+def test_unsolicited_cover_path_does_not_mutate_device_state() -> None:
+    """Delayed cover frames cannot bypass the saga's atomic commit."""
+    reducer = MowerStateReducer()
+    current = _make_device()
+    msg = LubaMsg(
+        nav=MctlNav(
+            cover_path_upload=CoverPathUploadT(
+                transaction_id=20,
+                current_frame=1,
+                total_frame=1,
+            )
+        )
+    )
+
+    updated = reducer.apply(current, msg)
+
+    assert updated.map is current.map
+    assert 20 not in updated.map.current_mow_path
 
 
 
