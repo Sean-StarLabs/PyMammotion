@@ -132,19 +132,16 @@ _logger = logging.getLogger(__name__)
 _AUTH_REJECTED = (UnauthorizedExceptionError, ReLoginRequiredError, AuthError)
 
 
-def _should_fetch_mow_path(device: MowerDevice, handle: DeviceHandle, path_hash: int) -> bool:
+def _should_fetch_mow_path(device: MowerDevice, path_hash: int) -> bool:
     """Return True if a MowPathSaga should be triggered.
 
     Mirrors the APK's HashDataManager.updateTotalHash() gate logic:
     - Not in firmware-update mode (DeviceWorkState.MODE_UPDATING == 16).
-    - No saga already running (!isUpdateMap / is_saga_active).
     - path_hash (work field 2 = work.getPathHash()) is non-zero.
     - Device's current bol_hash matches our computed_bol_hash (j == getDBCmHash())
       — prevents fetching cover paths against a stale map.
     """
     if device.report_data.dev.sys_status == WorkMode.MODE_UPDATING:
-        return False
-    if handle.queue.is_saga_active:
         return False
     if path_hash == 0:
         return False
@@ -254,10 +251,10 @@ class MammotionClient:
 
         Installs field watchers on the device handle:
 
-        * ``path_hash`` (work field 2) — fires ``MowPathSaga`` (fetch-only)
-          when the hash transitions to a non-zero value, our map is current
-          (computed_bol_hash == device bol_hash), and no matching cover path
-          is cached.
+        * the derived active task hash — fires ``MowPathSaga`` (fetch-only)
+          when the task identity transitions to a non-zero value, our map is
+          current (computed_bol_hash == device bol_hash), and no matching
+          cover path is cached.
         * ``(path_pos_x, path_pos_y)`` — rebuilds ``generated_mow_progress_geojson``
           as the mower progresses along the path.
         * ``bol_hash`` (from ``report_data.locations[0].bol_hash``) — fires
@@ -279,23 +276,27 @@ class MammotionClient:
         if handle is None:
             return None
 
-        async def _on_path_hashes_changed(path_hash: int) -> None:
+        async def _on_path_hash_changed(path_hash: int) -> None:
             device = cast(MowerDevice, handle.snapshot.raw)
+            if path_hash == 0:
+                return
             if device.map.current_mow_path and device.map.has_mow_path_for_hash(path_hash):
                 return  # Cache is valid for the current route
-            if device.map.current_mow_path:
-                # Cache exists but for a different route — clear it before fetching.
-                device.map.invalidate_mow_path(0)
-            if not _should_fetch_mow_path(device, handle, path_hash):
+            if not _should_fetch_mow_path(device, path_hash):
                 return
             _logger.debug(
-                "Device %s path_hash=%d — auto-fetching cover path",
+                "Device %s task_path_hash=%d — auto-fetching cover path",
                 device_name,
                 path_hash,
             )
             try:
                 current_work = GenerateRouteInformation.from_current_task_settings(device.work)
-                await self.start_mow_path_saga(device_name, zone_hashs=[], route_info=current_work, skip_planning=True)
+                await self.start_mow_path_saga(
+                    device_name,
+                    zone_hashs=[],
+                    route_info=current_work,
+                    skip_planning=True,
+                )
             except Exception:  # noqa: BLE001
                 _logger.warning("Auto-trigger MowPathSaga failed for %s", device_name, exc_info=True)
 
@@ -369,8 +370,8 @@ class MammotionClient:
                 _logger.warning("Auto-trigger plan sync failed for %s", device_name, exc_info=True)
 
         sub = handle.watch_field(
-            lambda s: s.raw.report_data.work.path_hash,  # type: ignore
-            _on_path_hashes_changed,
+            lambda s: s.raw.report_data.work.task_path_hash,  # type: ignore
+            _on_path_hash_changed,
         )
         progress_sub = handle.watch_field(
             lambda s: (s.raw.report_data.work.path_pos_x, s.raw.report_data.work.path_pos_y),  # type: ignore
@@ -2340,20 +2341,24 @@ class MammotionClient:
         if handle := self._device_registry.get_by_name(device_name):
             device = cast(MowerDevice, handle.snapshot.raw)
             work = device.report_data.work
-            if device.map.current_mow_path and device.map.has_mow_path_for_hash(work.path_hash):
+            path_hash = work.task_path_hash
+            if device.map.current_mow_path and device.map.has_mow_path_for_hash(path_hash):
                 return  # Cache is valid for the current route
-            if device.map.current_mow_path:
-                device.map.invalidate_mow_path(0)
-            if not _should_fetch_mow_path(device, handle, work.path_hash):
+            if not _should_fetch_mow_path(device, path_hash):
                 return
             _logger.debug(
-                "Device %s path_hash=%d — auto-fetching cover path",
+                "Device %s task_path_hash=%d — auto-fetching cover path",
                 device_name,
-                work.path_hash,
+                path_hash,
             )
             try:
                 current_work = GenerateRouteInformation.from_current_task_settings(device.work)
-                await self.start_mow_path_saga(device_name, zone_hashs=[], route_info=current_work, skip_planning=True)
+                await self.start_mow_path_saga(
+                    device_name,
+                    zone_hashs=[],
+                    route_info=current_work,
+                    skip_planning=True,
+                )
             except Exception:  # noqa: BLE001
                 _logger.warning("Auto-trigger MowPathSaga failed for %s", device_name, exc_info=True)
 
@@ -2402,7 +2407,7 @@ class MammotionClient:
             )
 
             async def _on_mow_path_complete() -> None:
-                expected_path_hash = saga.result_path_hash
+                path_hash = saga.result_path_hash
                 if not skip_planning:
                     current = handle.snapshot.raw
                     current_path_hash = (
@@ -2413,11 +2418,12 @@ class MammotionClient:
                     # third identity means this transfer is already stale.
                     if current_path_hash not in (0, saga.started_path_hash, saga.result_path_hash):
                         return
-                    expected_path_hash = current_path_hash
                 await handle.commit_mow_path_transactions(
                     saga.result,
-                    expected_path_hash,
+                    path_hash,
+                    validate_current_task=skip_planning,
                     replace=not skip_planning,
+                    planned_from_path_hash=saga.started_path_hash if not skip_planning else 0,
                 )
 
             await handle.enqueue_saga(saga, on_complete=_on_mow_path_complete)

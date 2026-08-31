@@ -370,13 +370,36 @@ class MowerDevice(Device):
             # wipe live mow data (cover path, zone list, GeoJSON) mid-job.
             sys_status = toapp_report_data.dev.sys_status if toapp_report_data.dev else 0
             is_actively_mowing = sys_status in MOWING_ACTIVE_MODES
+            reported_path_hash = int(toapp_report_data.work.path_hash)
+            if reported_path_hash in (0, 1):
+                reported_path_hash = 0
+            if self.map.current_mow_path and reported_path_hash:
+                associated_path_hash = self.map.current_mow_path_hash
+                pending_previous_hash = self.map.pending_planned_mow_path_previous_hash
+                if self.map.planned_mow_path_pending:
+                    if reported_path_hash == associated_path_hash:
+                        self.map.planned_mow_path_pending = False
+                        self.map.pending_planned_mow_path_previous_hash = 0
+                    elif reported_path_hash != pending_previous_hash or is_actively_mowing:
+                        self.map.invalidate_mow_path(0)
+                elif associated_path_hash and associated_path_hash != reported_path_hash:
+                    self.map.invalidate_mow_path(0)
+                elif associated_path_hash == 0:
+                    # A legacy cache can be adopted only when its packets carry
+                    # the same task hash. Otherwise the first report could bind
+                    # an old route to a completely new job.
+                    if self.map.has_mow_path_for_hash(reported_path_hash):
+                        self.map.current_mow_path_hash = reported_path_hash
+                    else:
+                        self.map.invalidate_mow_path(0)
             if not is_actively_mowing:
                 if (toapp_report_data.work.area >> 16) == 0 and toapp_report_data.work.ub_path_hash == 0:
                     self.work.zone_hashs = []
                     self.events.work_tasks_event.hash_area_map = {}
                     self.events.work_tasks_event.ids = []
                     self.map.invalidate_breakpoint_line(0)
-                self.map.invalidate_mow_path(toapp_report_data.work.path_hash)
+                if not self.map.planned_mow_path_pending:
+                    self.map.invalidate_mow_path(toapp_report_data.work.path_hash)
             self.map.invalidate_breakpoint_line(toapp_report_data.work.ub_path_hash)
 
         self.report_data.update(toapp_report_data)

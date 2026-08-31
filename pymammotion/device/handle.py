@@ -907,19 +907,26 @@ class DeviceHandle:
     async def commit_mow_path_transactions(
         self,
         transactions: dict[int, dict[int, MowPath]],
-        expected_path_hash: int = 0,
+        path_hash: int = 0,
         *,
+        validate_current_task: bool = True,
         replace: bool = False,
+        planned_from_path_hash: int = 0,
     ) -> bool:
         """Commit complete cover-path data through the device state pipeline."""
         current = self.state_machine.current.raw
         if not isinstance(current, MowerDevice):
             return False
-        if expected_path_hash and current.report_data.work.task_path_hash != expected_path_hash:
+        if validate_current_task and path_hash and current.report_data.work.task_path_hash != path_hash:
             return False
         updated = dataclasses.replace(current)
         updated.map = copy.deepcopy(current.map)
-        updated.map.commit_mow_path_transactions(transactions, replace=replace)
+        updated.map.commit_mow_path_transactions(
+            transactions,
+            path_hash,
+            replace=replace,
+            planned_from_path_hash=planned_from_path_hash,
+        )
         if updated.location.RTK.latitude != 0.0:
             updated.map.generate_mowing_geojson(updated.location.RTK)
         snapshot, _ = self.state_machine.apply(updated, self._availability)

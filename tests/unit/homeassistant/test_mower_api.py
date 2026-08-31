@@ -1,4 +1,5 @@
 """Tests for MammotionClient.setup_device_watchers auto-trigger logic."""
+
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
@@ -24,7 +25,9 @@ def _set_snapshot(
     device = MagicMock()
     device.report_data.work.ub_path_hash = ub_path_hash
     device.report_data.work.path_hash = path_hash
+    device.report_data.work.task_path_hash = path_hash if path_hash not in (0, 1) else 0
     device.map.current_mow_path = current_mow_path if current_mow_path is not None else {}
+    device.map.has_mow_path_for_hash.return_value = bool(device.map.current_mow_path)
     handle.snapshot.raw = device
 
 
@@ -36,7 +39,7 @@ def _make_client_with_handle(
     """Return (client, handle_mock, captured_handlers) for the path-hashes watcher.
 
     ``captured_handlers[0]`` is the handler passed to ``handle.watch_field`` for
-    the (ub_path_hash, path_hash) getter.
+    the task_path_hash getter.
     """
     client = MammotionClient.__new__(MammotionClient)
     client._watcher_subscriptions = {}
@@ -77,7 +80,7 @@ async def test_watcher_no_trigger_when_hashes_are_zero() -> None:
     client, handle, handlers = _make_client_with_handle()
     _set_snapshot(handle, ub_path_hash=0, path_hash=0)
 
-    await handlers[0]((0, 0))
+    await handlers[0](0)
 
     client.start_mow_path_saga.assert_not_awaited()
 
@@ -92,7 +95,7 @@ async def test_watcher_no_trigger_when_path_hash_is_one() -> None:
     client, handle, handlers = _make_client_with_handle()
     _set_snapshot(handle, ub_path_hash=0, path_hash=1)
 
-    await handlers[0]((0, 1))
+    await handlers[0](0)
 
     client.start_mow_path_saga.assert_not_awaited()
 
@@ -112,24 +115,29 @@ async def test_watcher_no_trigger_when_path_already_loaded() -> None:
         current_mow_path={123: {0: MagicMock()}},
     )
 
-    await handlers[0]((99, 42))
+    await handlers[0](42)
 
     client.start_mow_path_saga.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
-# Test: saga_active guard prevents double-queueing
+# Test: a task transition during another saga is queued behind it
 # ---------------------------------------------------------------------------
 
 
-async def test_watcher_skips_when_saga_already_active() -> None:
-    """If a saga is already active the watcher must not enqueue another."""
+async def test_watcher_preserves_task_change_while_saga_active() -> None:
+    """A replacement task is queued so its one-shot transition is not lost."""
     client, handle, handlers = _make_client_with_handle(saga_active=True)
-    _set_snapshot(handle, ub_path_hash=42, path_hash=0, current_mow_path={})
+    _set_snapshot(handle, ub_path_hash=42, path_hash=42, current_mow_path={})
+    handle.snapshot.raw.report_data.locations = [MagicMock(bol_hash=123)]
+    handle.snapshot.raw.map.computed_bol_hash = 123
 
-    await handlers[0]((42, 0))
+    await handlers[0](42)
 
-    client.start_mow_path_saga.assert_not_awaited()
+    client.start_mow_path_saga.assert_awaited_once()
+    assert client.start_mow_path_saga.await_args.args == ("Luba-Test",)
+    assert client.start_mow_path_saga.await_args.kwargs["zone_hashs"] == []
+    assert client.start_mow_path_saga.await_args.kwargs["skip_planning"] is True
 
 
 # ---------------------------------------------------------------------------

@@ -410,6 +410,9 @@ class HashList(DataClassORJSONMixin):
     plan: dict[str, Plan] = field(default_factory=dict)
     area_name: list[AreaHashNameList] = field(default_factory=list)
     current_mow_path: dict[int, dict[int, MowPath]] = field(default_factory=dict)
+    current_mow_path_hash: int = 0
+    planned_mow_path_pending: bool = False
+    pending_planned_mow_path_previous_hash: int = 0
     generated_geojson: dict[str, Any] = field(default_factory=dict)
     geojson_yaw: float = 0.0  # RTK yaw (radians) used when generated_geojson was last built
     generated_mow_path_geojson: dict[str, Any] = field(default_factory=dict)
@@ -910,8 +913,10 @@ class HashList(DataClassORJSONMixin):
     def commit_mow_path_transactions(
         self,
         transactions: dict[int, dict[int, MowPath]],
+        path_hash: int = 0,
         *,
         replace: bool = False,
+        planned_from_path_hash: int = 0,
     ) -> None:
         """Publish complete cover-path transactions as one state update."""
         incomplete = {
@@ -922,7 +927,19 @@ class HashList(DataClassORJSONMixin):
         if incomplete:
             msg = f"cannot commit incomplete mow-path transactions: {sorted(incomplete)}"
             raise ValueError(msg)
+        if replace or (path_hash and self.current_mow_path_hash not in (0, path_hash)):
+            self.generated_mow_path_geojson = {}
+            self.generated_mow_progress_geojson = {}
+        if path_hash and self.current_mow_path_hash not in (0, path_hash):
+            self.current_mow_path = {}
         self.current_mow_path = dict(transactions) if replace else {**self.current_mow_path, **transactions}
+        self.current_mow_path_hash = path_hash
+        self.planned_mow_path_pending = replace and path_hash not in (0, 1)
+        self.pending_planned_mow_path_previous_hash = (
+            planned_from_path_hash
+            if self.planned_mow_path_pending and planned_from_path_hash not in (0, path_hash)
+            else 0
+        )
 
     @staticmethod
     def mow_path_transaction_complete(frames: dict[int, MowPath]) -> bool:
@@ -1081,8 +1098,11 @@ class HashList(DataClassORJSONMixin):
         be preserved — the device advances ub_path_hash through segments during
         a mow and wiping on every change would discard live data.
         """
-        if path_hash == 0:
+        if path_hash in (0, 1):
             self.current_mow_path = {}
+            self.current_mow_path_hash = 0
+            self.planned_mow_path_pending = False
+            self.pending_planned_mow_path_previous_hash = 0
             self.generated_mow_path_geojson = {}
             self.generated_mow_progress_geojson = {}
             self.last_ub_path_hash = 0
@@ -1093,6 +1113,8 @@ class HashList(DataClassORJSONMixin):
         Matches against ``path_packets[0].path_hash`` in any transaction's first
         frame — equals ``work.path_hash`` (field 2) when the cached data is current.
         """
+        if path_hash != 0 and self.current_mow_path and self.current_mow_path_hash == path_hash:
+            return True
         for frames in self.current_mow_path.values():
             for mow_path in frames.values():
                 if mow_path.path_packets and mow_path.path_packets[0].path_hash == path_hash:

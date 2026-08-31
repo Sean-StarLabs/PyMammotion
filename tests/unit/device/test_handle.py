@@ -160,7 +160,7 @@ async def test_commit_mow_path_transactions_rejects_changed_route() -> None:
     handle = DeviceHandle(device_id="dev-route", device_name=device.name, initial_device=device)
     transactions = {20: {1: MowPath(transaction_id=20, current_frame=1, total_frame=1)}}
 
-    committed = await handle.commit_mow_path_transactions(transactions, expected_path_hash=100)
+    committed = await handle.commit_mow_path_transactions(transactions, path_hash=100)
 
     assert committed is False
     assert handle.snapshot.raw.map.current_mow_path == {}

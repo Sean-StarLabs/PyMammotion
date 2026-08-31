@@ -1,4 +1,5 @@
 """Tests for MammotionClient (Wave 4 top-level API)."""
+
 from __future__ import annotations
 
 import asyncio
@@ -344,14 +345,25 @@ async def test_start_mow_path_saga_commits_result_on_completion() -> None:
         mock_saga_instance.max_attempts = 1
         mock_saga_instance.execute = AsyncMock()
         mock_saga_instance.result = {}
-        mock_saga_instance.started_path_hash = 0
-        mock_saga_instance.result_path_hash = 0
+        mock_saga_instance.started_path_hash = 123
+        mock_saga_instance.result_path_hash = 123
         MockSaga.return_value = mock_saga_instance
 
-        await client.start_mow_path_saga("Luba-Mow", zone_hashs=[1, 2])
+        await client.start_mow_path_saga(
+            "Luba-Mow",
+            zone_hashs=[1, 2],
+            skip_planning=True,
+        )
         await asyncio.sleep(0.15)
 
-    handle.commit_mow_path_transactions.assert_awaited_once_with({}, 0, replace=True)
+    handle.commit_mow_path_transactions.assert_awaited_once_with(
+        {},
+        123,
+        validate_current_task=True,
+        replace=False,
+        planned_from_path_hash=0,
+    )
+    assert callable(MockSaga.call_args.kwargs["get_task_path_hash"])
     await handle.stop()
 
 
@@ -379,7 +391,13 @@ async def test_planned_mow_path_accepts_device_confirmed_route_hash() -> None:
         await client.start_mow_path_saga("Luba-Plan", zone_hashs=[1])
         await asyncio.sleep(0.15)
 
-    handle.commit_mow_path_transactions.assert_awaited_once_with({}, 200, replace=True)
+    handle.commit_mow_path_transactions.assert_awaited_once_with(
+        {},
+        200,
+        validate_current_task=False,
+        replace=True,
+        planned_from_path_hash=100,
+    )
     await handle.stop()
 
 
@@ -437,7 +455,13 @@ async def test_running_mow_path_binds_hash_when_saga_executes() -> None:
         handle.queue.resume_after_reconnect()
         await asyncio.sleep(0.15)
 
-    handle.commit_mow_path_transactions.assert_awaited_once_with({}, 200, replace=False)
+    handle.commit_mow_path_transactions.assert_awaited_once_with(
+        {},
+        200,
+        validate_current_task=True,
+        replace=False,
+        planned_from_path_hash=0,
+    )
     await handle.stop()
 
 
@@ -486,12 +510,6 @@ async def test_start_map_sync_skips_geojson_when_rtk_zero() -> None:
 # ---------------------------------------------------------------------------
 
 
-
-
-
-
-
-
 def _access_token(iot: str, robot: str) -> str:
     """Mint an unsigned-verifiable access token carrying the iot/robot/exp claims.
 
@@ -532,20 +550,14 @@ def _populated_mammotion_http(account: str = "user@test.com") -> MammotionHTTP:
     return http
 
 
-
-
-
-
-
-
-
-
 # ---------------------------------------------------------------------------
 # _bootstrap_mammotion_mqtt — connect() and confirm_share call-count invariants
 # ---------------------------------------------------------------------------
 
 
-def _make_share_record(*, is_receiver: int = 1, status: int = -1, batch_id: str = "batch1", record_id: str = "1") -> MagicMock:
+def _make_share_record(
+    *, is_receiver: int = 1, status: int = -1, batch_id: str = "batch1", record_id: str = "1"
+) -> MagicMock:
     """Return a MagicMock shaped like a ShareRecord."""
     r = MagicMock()
     r.is_receiver = is_receiver
@@ -555,7 +567,9 @@ def _make_share_record(*, is_receiver: int = 1, status: int = -1, batch_id: str 
     return r
 
 
-def _make_device_record(device_name: str = "Yuka-TEST", iot_id: str = "iot-yuka", product_key: str = "pk1") -> MagicMock:
+def _make_device_record(
+    device_name: str = "Yuka-TEST", iot_id: str = "iot-yuka", product_key: str = "pk1"
+) -> MagicMock:
     """Return a MagicMock shaped like a DeviceRecord."""
     r = MagicMock()
     r.device_name = device_name
@@ -573,9 +587,7 @@ def _make_mock_http(
     """Return a MagicMock shaped like MammotionHTTP with the given fixture data."""
     http = MagicMock()
     http.get_user_device_list = AsyncMock(return_value=MagicMock(data=[]))
-    http.get_user_shared_device_page = AsyncMock(
-        return_value=MagicMock(data=MagicMock(records=share_records or []))
-    )
+    http.get_user_shared_device_page = AsyncMock(return_value=MagicMock(data=MagicMock(records=share_records or [])))
     # get_user_device_page both returns data AND updates http.device_records (side-effect)
     page_data = MagicMock()
     page_data.records = device_records or []
@@ -587,18 +599,6 @@ def _make_mock_http(
     http.mqtt_credentials = mqtt_creds or MagicMock()
     http.login_info = MagicMock()
     return http
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -659,7 +659,7 @@ async def test_send_command_with_args_prefer_ble_uses_ble_transport() -> None:
     # Confirm the BLE transport is registered on the handle before sending.
     assert handle._transports.get(TransportType.BLE) is ble  # noqa: SLF001
 
-    fake_bytes = b"\xDE\xAD\xBE\xEF"
+    fake_bytes = b"\xde\xad\xbe\xef"
     patcher = _stub_commands(handle, fake_bytes)
     try:
         await client._device_registry.register(handle)
@@ -684,7 +684,7 @@ async def test_send_command_with_args_uses_connected_ble_over_mqtt() -> None:
     await handle.add_transport(mqtt)
     await handle.add_transport(ble)
 
-    fake_bytes = b"\xCA\xFE"
+    fake_bytes = b"\xca\xfe"
     patcher = _stub_commands(handle, fake_bytes)
     try:
         await client._device_registry.register(handle)
@@ -710,7 +710,7 @@ async def test_send_command_with_args_uses_mqtt_when_ble_disconnected() -> None:
     await handle.add_transport(mqtt)
     await handle.add_transport(ble)
 
-    fake_bytes = b"\xCA\xFE"
+    fake_bytes = b"\xca\xfe"
     patcher = _stub_commands(handle, fake_bytes)
     try:
         await client._device_registry.register(handle)
@@ -744,7 +744,7 @@ async def test_send_command_with_args_prefer_ble_sends_over_mqtt_and_warms_ble()
     await handle.add_transport(mqtt)
     await handle.add_transport(ble)
 
-    fake_bytes = b"\xAB\xCD"
+    fake_bytes = b"\xab\xcd"
     patcher = _stub_commands(handle, fake_bytes)
     try:
         await client._device_registry.register(handle)
@@ -924,7 +924,7 @@ async def test_send_command_with_args_prefer_ble_uses_mqtt_while_ble_connect_pen
     await handle.add_transport(mqtt)
     await handle.add_transport(ble)
 
-    fake_bytes = b"\xAB\xCD"
+    fake_bytes = b"\xab\xcd"
     patcher = _stub_commands(handle, fake_bytes)
     try:
         await client._device_registry.register(handle)
@@ -1198,6 +1198,7 @@ async def test_update_availability_restarts_loop_on_reconnect() -> None:
     # Start from disconnected.
     handle.update_availability(TransportType.CLOUD_ALIYUN, TransportAvailability.DISCONNECTED)
     from pymammotion.state.device_state import DeviceConnectionState
+
     assert handle.availability.connection_state != DeviceConnectionState.CONNECTED
 
     # Transition to connected → loop should restart.
@@ -1251,11 +1252,11 @@ async def test_send_raw_ble_connect_failure_falls_back_to_mqtt() -> None:
     handle._transports[TransportType.BLE] = ble  # noqa: SLF001
     handle._transports[TransportType.CLOUD_ALIYUN] = mqtt  # noqa: SLF001
 
-    await handle.send_raw(b"\xAB\xCD", prefer_ble=True)
+    await handle.send_raw(b"\xab\xcd", prefer_ble=True)
     await asyncio.sleep(0)  # let the background BLE connect run (and fail, swallowed)
 
     # Command sent via MQTT (the working link); BLE reconnect attempted in background.
-    mqtt.send.assert_awaited_once_with(b"\xAB\xCD", iot_id="", firmware_version=ANY)
+    mqtt.send.assert_awaited_once_with(b"\xab\xcd", iot_id="", firmware_version=ANY)
     ble.send.assert_not_awaited()
     ble.connect.assert_awaited_once()
 
@@ -1280,7 +1281,7 @@ async def test_send_raw_no_usable_transport_propagates() -> None:
     handle._transports[TransportType.BLE] = ble  # noqa: SLF001
 
     with pytest.raises(NoTransportAvailableError):
-        await handle.send_raw(b"\xAB\xCD", prefer_ble=True)
+        await handle.send_raw(b"\xab\xcd", prefer_ble=True)
 
     ble.connect.assert_not_awaited()  # unusable BLE: no background connect attempted
 
@@ -1311,7 +1312,7 @@ async def test_send_raw_no_usable_transport_mqtt_offline_propagates() -> None:
     handle._transports[TransportType.CLOUD_ALIYUN] = mqtt  # noqa: SLF001
 
     with pytest.raises(NoTransportAvailableError):
-        await handle.send_raw(b"\xAB\xCD", prefer_ble=True)
+        await handle.send_raw(b"\xab\xcd", prefer_ble=True)
     mqtt.send.assert_not_awaited()
 
 
@@ -1350,10 +1351,10 @@ async def test_send_raw_skips_ble_reconnect_when_not_usable() -> None:
     handle._transports[TransportType.BLE] = ble  # noqa: SLF001
     handle._transports[TransportType.CLOUD_ALIYUN] = mqtt  # noqa: SLF001
 
-    await handle.send_raw(b"\xCA\xFE", prefer_ble=True)
+    await handle.send_raw(b"\xca\xfe", prefer_ble=True)
 
     ble.connect.assert_not_awaited()  # <- the whole point of the gate
-    mqtt.send.assert_awaited_once_with(b"\xCA\xFE", iot_id="", firmware_version=ANY)
+    mqtt.send.assert_awaited_once_with(b"\xca\xfe", iot_id="", firmware_version=ANY)
     ble.send.assert_not_awaited()
 
 
@@ -1385,7 +1386,7 @@ async def test_update_ble_device_returns_true_on_first_set_false_on_same_address
 
     assert await client.update_ble_device("Luba-Update", dev1) is True
     assert await client.update_ble_device("Luba-Update", dev2) is False  # same address
-    assert await client.update_ble_device("Luba-Update", dev3) is True   # different address
+    assert await client.update_ble_device("Luba-Update", dev3) is True  # different address
 
     await handle.stop()
 
@@ -1667,7 +1668,7 @@ async def test_send_command_with_args_skips_immediately_when_offline() -> None:
     )
     await client._device_registry.register(handle)
 
-    fake_bytes = b"\xCA\xFE"
+    fake_bytes = b"\xca\xfe"
     patcher = _stub_commands(handle, fake_bytes)
     sleep_calls: list[float] = []
     real_sleep = asyncio.sleep
@@ -1727,8 +1728,8 @@ async def test_has_usable_transport_true_when_offline_with_ble_usable_but_discon
     handle = make_handle("dev1", "Luba-Recovery")
     mqtt = _make_connected_transport(TransportType.CLOUD_ALIYUN)
     ble = _make_connected_transport(TransportType.BLE)
-    ble.is_connected = False     # GATT not up yet
-    ble.is_usable = True         # has cached BLEDevice, not in cooldown
+    ble.is_connected = False  # GATT not up yet
+    ble.is_usable = True  # has cached BLEDevice, not in cooldown
     await handle.add_transport(mqtt)
     await handle.add_transport(ble)
     handle._availability = DeviceAvailability(  # noqa: SLF001

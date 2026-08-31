@@ -1,11 +1,14 @@
 """Tests for MowingDevice JSON serialization with int-keyed HashList fields."""
+
 from __future__ import annotations
 
 import json
 
 from pymammotion.data.model.device import MowingDevice
-from pymammotion.data.model.hash_list import FrameList, HashList, MowPath, NavGetCommData
+from pymammotion.data.model.hash_list import FrameList, HashList, MowPath, MowPathPacket, NavGetCommData
 from pymammotion.data.model.report_info import WorkData
+from pymammotion.proto import ReportInfoData, RptDevStatus, RptWork
+from pymammotion.utility.constant import WorkMode
 
 
 def _make_hash_list_with_int_keys() -> HashList:
@@ -57,6 +60,216 @@ def test_work_data_task_path_hash_excludes_segments_and_end_sentinels() -> None:
     assert WorkData(path_hash=123, ub_path_hash=456).task_path_hash == 123
     assert WorkData(path_hash=1, ub_path_hash=456).task_path_hash == 0
     assert WorkData(path_hash=0, ub_path_hash=789).task_path_hash == 0
+
+
+def test_resuming_same_task_preserves_cached_mow_path() -> None:
+    """An idle-to-working transition does not imply a different task."""
+    device = MowingDevice(name="Yuka-Test")
+    device.map = _make_hash_list_with_int_keys()
+    device.map.current_mow_path_hash = 123
+    device.report_data.dev.sys_status = WorkMode.MODE_READY
+
+    device.update_report_data(
+        ReportInfoData(
+            dev=RptDevStatus(sys_status=WorkMode.MODE_WORKING),
+            work=RptWork(path_hash=123),
+        )
+    )
+
+    assert device.map.current_mow_path
+    assert device.map.current_mow_path_hash == 123
+
+
+def test_reported_new_task_clears_cached_mow_path() -> None:
+    """A different reported task identity invalidates the previous route."""
+    device = MowingDevice(name="Yuka-Test")
+    device.map = _make_hash_list_with_int_keys()
+    device.map.current_mow_path_hash = 123
+    device.report_data.work = WorkData(path_hash=123)
+
+    device.update_report_data(
+        ReportInfoData(
+            dev=RptDevStatus(sys_status=WorkMode.MODE_WORKING),
+            work=RptWork(path_hash=456),
+        )
+    )
+
+    assert device.map.current_mow_path == {}
+    assert device.map.current_mow_path_hash == 0
+
+
+def test_unverified_legacy_cached_path_is_cleared_for_reported_task() -> None:
+    """An old route is not guessed to belong to the first task seen after restore."""
+    device = MowingDevice(name="Yuka-Test")
+    device.map = _make_hash_list_with_int_keys()
+
+    device.update_report_data(
+        ReportInfoData(
+            dev=RptDevStatus(sys_status=WorkMode.MODE_WORKING),
+            work=RptWork(path_hash=123),
+        )
+    )
+
+    assert device.map.current_mow_path == {}
+    assert device.map.current_mow_path_hash == 0
+
+
+def test_verified_legacy_cached_path_adopts_reported_task_hash() -> None:
+    """Packet metadata can safely associate a restored route with its task."""
+    device = MowingDevice(name="Yuka-Test")
+    device.map.current_mow_path = {
+        1: {
+            1: MowPath(
+                transaction_id=1,
+                current_frame=1,
+                total_frame=1,
+                path_packets=[MowPathPacket(path_hash=123)],
+            )
+        }
+    }
+
+    device.update_report_data(
+        ReportInfoData(
+            dev=RptDevStatus(sys_status=WorkMode.MODE_WORKING),
+            work=RptWork(path_hash=123),
+        )
+    )
+
+    assert device.map.current_mow_path
+    assert device.map.current_mow_path_hash == 123
+
+
+def test_breakpoint_change_preserves_task_route() -> None:
+    """Advancing to another segment does not invalidate the task route."""
+    device = MowingDevice(name="Yuka-Test")
+    device.map = _make_hash_list_with_int_keys()
+    device.map.current_mow_path_hash = 123
+    device.report_data.work = WorkData(path_hash=123, ub_path_hash=10)
+
+    device.update_report_data(
+        ReportInfoData(
+            dev=RptDevStatus(sys_status=WorkMode.MODE_WORKING),
+            work=RptWork(path_hash=123, ub_path_hash=20),
+        )
+    )
+
+    assert device.map.current_mow_path
+    assert device.map.current_mow_path_hash == 123
+
+
+def test_active_report_preserves_current_job_path() -> None:
+    """A report for an already active task keeps its associated route."""
+    device = MowingDevice(name="Yuka-Test")
+    device.map = _make_hash_list_with_int_keys()
+    device.map.current_mow_path_hash = 123
+    device.report_data.dev.sys_status = WorkMode.MODE_WORKING
+
+    device.update_report_data(
+        ReportInfoData(
+            dev=RptDevStatus(sys_status=WorkMode.MODE_WORKING),
+            work=RptWork(path_hash=123),
+        )
+    )
+
+    assert device.map.current_mow_path
+    assert device.map.current_mow_path_hash == 123
+
+
+def test_planned_route_survives_previous_reported_hash() -> None:
+    """Repeated reports for the pre-planning task do not erase the preview."""
+    device = MowingDevice(name="Yuka-Test")
+    device.map = _make_hash_list_with_int_keys()
+    device.map.current_mow_path_hash = 200
+    device.map.planned_mow_path_pending = True
+    device.map.pending_planned_mow_path_previous_hash = 100
+
+    device.update_report_data(
+        ReportInfoData(
+            dev=RptDevStatus(sys_status=WorkMode.MODE_READY),
+            work=RptWork(path_hash=100),
+        )
+    )
+
+    assert device.map.current_mow_path
+    assert device.map.current_mow_path_hash == 200
+    assert device.map.pending_planned_mow_path_previous_hash == 100
+
+
+def test_planned_route_is_confirmed_by_its_reported_hash() -> None:
+    """The planned hash clears the pending previous-task marker."""
+    device = MowingDevice(name="Yuka-Test")
+    device.map = _make_hash_list_with_int_keys()
+    device.map.current_mow_path_hash = 200
+    device.map.planned_mow_path_pending = True
+    device.map.pending_planned_mow_path_previous_hash = 100
+
+    device.update_report_data(
+        ReportInfoData(
+            dev=RptDevStatus(sys_status=WorkMode.MODE_WORKING),
+            work=RptWork(path_hash=200),
+        )
+    )
+
+    assert device.map.current_mow_path
+    assert device.map.planned_mow_path_pending is False
+    assert device.map.pending_planned_mow_path_previous_hash == 0
+
+
+def test_third_task_hash_invalidates_pending_planned_route() -> None:
+    """A task unrelated to either side of planning supersedes the preview."""
+    device = MowingDevice(name="Yuka-Test")
+    device.map = _make_hash_list_with_int_keys()
+    device.map.current_mow_path_hash = 200
+    device.map.planned_mow_path_pending = True
+    device.map.pending_planned_mow_path_previous_hash = 100
+
+    device.update_report_data(
+        ReportInfoData(
+            dev=RptDevStatus(sys_status=WorkMode.MODE_WORKING),
+            work=RptWork(path_hash=300),
+        )
+    )
+
+    assert device.map.current_mow_path == {}
+    assert device.map.planned_mow_path_pending is False
+    assert device.map.pending_planned_mow_path_previous_hash == 0
+
+
+def test_first_planned_route_survives_idle_zero_hash() -> None:
+    """An idle sentinel cannot erase a preview created before any task existed."""
+    device = MowingDevice(name="Yuka-Test")
+    device.map = _make_hash_list_with_int_keys()
+    device.map.current_mow_path_hash = 200
+    device.map.planned_mow_path_pending = True
+
+    device.update_report_data(
+        ReportInfoData(
+            dev=RptDevStatus(sys_status=WorkMode.MODE_READY),
+            work=RptWork(path_hash=0),
+        )
+    )
+
+    assert device.map.current_mow_path
+    assert device.map.planned_mow_path_pending is True
+
+
+def test_active_previous_task_invalidates_pending_planned_route() -> None:
+    """A resumed old task supersedes a preview that was never started."""
+    device = MowingDevice(name="Yuka-Test")
+    device.map = _make_hash_list_with_int_keys()
+    device.map.current_mow_path_hash = 200
+    device.map.planned_mow_path_pending = True
+    device.map.pending_planned_mow_path_previous_hash = 100
+
+    device.update_report_data(
+        ReportInfoData(
+            dev=RptDevStatus(sys_status=WorkMode.MODE_WORKING),
+            work=RptWork(path_hash=100),
+        )
+    )
+
+    assert device.map.current_mow_path == {}
+    assert device.map.planned_mow_path_pending is False
 
 
 # ===========================================================================

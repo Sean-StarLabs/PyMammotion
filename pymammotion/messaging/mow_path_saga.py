@@ -132,6 +132,13 @@ class MowPathSaga(Saga):
             # from the prior preview would either mix routes or discard the
             # reused packets when the new result replaces the cache.
             return remaining
+        cache_matches_task = (
+            not current_map.current_mow_path
+            or self.result_path_hash in {0, current_map.current_mow_path_hash}
+            or (current_map.current_mow_path_hash == 0 and current_map.has_mow_path_for_hash(self.result_path_hash))
+        )
+        if not cache_matches_task:
+            return remaining
         return [path_hash for path_hash in remaining if not current_map.has_mow_path_for_hash(path_hash)]
 
     @staticmethod
@@ -240,6 +247,8 @@ class MowPathSaga(Saga):
                 route_frame = self.extract_nav_frame(response, "bidire_reqconver_path")
                 assert route_frame is not None  # noqa: S101 — send_and_wait already matched this field
                 self._route_val = route_frame[1]
+                # Planning mode always trusts the route hash confirmed by the
+                # device. The accepted hash only pins fetch-only running jobs.
                 self.result_path_hash = int(self._route_val.path_hash)
                 _logger.debug(
                     "MowPathSaga: route confirmed — sub_cmd=%d  path_hash=%d",
