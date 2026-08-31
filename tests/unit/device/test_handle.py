@@ -1,7 +1,9 @@
 """Tests for DeviceHandle and DeviceRegistry."""
+
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -335,9 +337,7 @@ async def test_ble_message_does_not_clear_reported_offline() -> None:
     await handle.add_transport(ble)
     handle.update_availability(TransportType.CLOUD_ALIYUN, TransportAvailability.CONNECTED)
 
-    handle.update_availability(
-        TransportType.CLOUD_ALIYUN, TransportAvailability.CONNECTED, mqtt_reported_offline=True
-    )
+    handle.update_availability(TransportType.CLOUD_ALIYUN, TransportAvailability.CONNECTED, mqtt_reported_offline=True)
     assert handle.availability.mqtt_reported_offline is True
 
     _patch_raw_message_internals(handle)
@@ -418,6 +418,25 @@ async def test_snapshot_raw_updates_after_on_raw_message() -> None:
     assert handle.snapshot.raw.report_data.dev.battery_val == 42
 
 
+async def test_pool_report_advances_applied_telemetry_generation() -> None:
+    """Pool-cleaner report_info frames satisfy the public freshness contract."""
+    from pymammotion.data.model.device import PoolCleanerDevice
+    from pymammotion.proto import DevStatueT, LubaMsg, MctlSys, ReportInfoT
+
+    handle = DeviceHandle(
+        device_id="dev-pool",
+        device_name="Spino-E1abc",
+        initial_device=PoolCleanerDevice(name="Spino-E1abc"),
+    )
+    before = handle.report_data_token
+    msg = LubaMsg(sys=MctlSys(report_info=ReportInfoT(dev_status=DevStatueT(bat_val=68))))
+
+    await handle.on_raw_message(bytes(msg))
+
+    assert handle.report_data_token == before + 1
+    assert handle.snapshot.raw.pool_state.battery == 68
+
+
 async def test_on_raw_message_drops_frame_with_malformed_report_data(caplog: pytest.LogCaptureFixture) -> None:
     """A corrupt frame whose deserialization raises must be dropped + logged, not propagated.
 
@@ -439,8 +458,11 @@ async def test_on_raw_message_drops_frame_with_malformed_report_data(caplog: pyt
     )
 
     # First a clean frame so we have a known-good baseline state.
-    await handle.on_raw_message(bytes(LubaMsg(sys=MctlSys(toapp_report_data=ReportInfoData(dev=RptDevStatus(battery_val=55))))))
+    await handle.on_raw_message(
+        bytes(LubaMsg(sys=MctlSys(toapp_report_data=ReportInfoData(dev=RptDevStatus(battery_val=55)))))
+    )
     assert handle.snapshot.raw.report_data.dev.battery_val == 55
+    applied_generation = handle.report_data_token
 
     emitted: list[object] = []
     handle.subscribe_state_changed(lambda s: emitted.append(s))  # type: ignore[arg-type,return-value]
@@ -456,6 +478,7 @@ async def test_on_raw_message_drops_frame_with_malformed_report_data(caplog: pyt
 
     # State preserved, no snapshot emitted for the bad frame, and the drop was logged at ERROR.
     assert handle.snapshot.raw.report_data.dev.battery_val == 55
+    assert handle.report_data_token == applied_generation
     assert emitted == []
     error_records = [r for r in caplog.records if r.levelno == logging.ERROR and "dropping frame" in r.getMessage()]
     assert error_records, "expected an ERROR log for the dropped frame"
@@ -744,6 +767,7 @@ def _make_concrete_transport() -> Transport:
         @property
         def availability(self):  # type: ignore[override]
             from pymammotion.transport.base import TransportAvailability
+
             return TransportAvailability.CONNECTED
 
         async def connect(self) -> None:
@@ -932,7 +956,7 @@ async def test_ble_transport_not_blocked_by_rate_limited_flag() -> None:
     ble.last_received_monotonic = 0.0
     handle._transports[TransportType.BLE] = ble  # noqa: SLF001
 
-    await handle._send_marked(ble, b"\xAA\xBB")  # noqa: SLF001
+    await handle._send_marked(ble, b"\xaa\xbb")  # noqa: SLF001
 
     ble.send.assert_awaited_once()
 
@@ -983,9 +1007,18 @@ def rpt_handle(monkeypatch: pytest.MonkeyPatch) -> DeviceHandle:
     h = DeviceHandle.__new__(DeviceHandle)
     h.device_name = "Luba-TEST"
     h._last_report_data_at = 0.0
+    h._report_data_generation = 0
     h._report_data_event = asyncio.Event()
+    h._report_refresh_deadline = 0.0
+    h._report_refresh_required_generation = 0
+    h._report_refresh_in_flight = False
+    h._report_refresh_retry_task = None
+    h._inbound_dispatch_tasks = set()
+    h._ble_stream_active = False
+    h._skips_activity_loops = False
+    h._stopping = False
     mocked_commands = MagicMock()
-    mocked_commands.send_todev_ble_sync = MagicMock(return_value=b"\xAAsync")
+    mocked_commands.send_todev_ble_sync = MagicMock(return_value=b"\xaasync")
     monkeypatch.setattr(DeviceHandle, "commands", property(lambda self: mocked_commands))
     return h
 
@@ -993,7 +1026,306 @@ def rpt_handle(monkeypatch: pytest.MonkeyPatch) -> DeviceHandle:
 def _feed_report(handle: DeviceHandle) -> None:
     """Simulate a ``toapp_report_data`` frame landing, as ``on_raw_message`` would."""
     handle._last_report_data_at = handle._last_report_data_at + 1.0
+    handle._report_data_generation += 1
     handle._report_data_event.set()
+
+
+async def test_ensure_fresh_report_data_accepts_recent_report(
+    rpt_handle: DeviceHandle,
+) -> None:
+    """Recent report telemetry does not cause another device poll."""
+    rpt_handle._last_report_data_at = asyncio.get_running_loop().time()
+    rpt_handle._enqueue_report_refresh = AsyncMock()
+
+    assert await rpt_handle.ensure_fresh_report_data(max_age_s=5.0, timeout=0.1)
+    rpt_handle._enqueue_report_refresh.assert_not_awaited()
+
+
+async def test_ensure_fresh_report_data_waits_for_new_report(
+    rpt_handle: DeviceHandle,
+) -> None:
+    """Stale state is accepted only after a newer report frame arrives."""
+
+    async def enqueue_report_refresh() -> None:
+        asyncio.get_running_loop().call_soon(_feed_report, rpt_handle)
+
+    rpt_handle._enqueue_report_refresh = enqueue_report_refresh
+
+    assert await rpt_handle.ensure_fresh_report_data(max_age_s=0.0, timeout=0.1)
+
+
+async def test_ensure_fresh_report_data_times_out_without_report(
+    rpt_handle: DeviceHandle,
+) -> None:
+    """A queued request without telemetry is not reported as fresh state."""
+    rpt_handle._enqueue_report_refresh = AsyncMock()
+
+    assert not await rpt_handle.ensure_fresh_report_data(
+        max_age_s=0.0,
+        timeout=0.01,
+    )
+
+
+async def test_ensure_fresh_report_data_bypasses_snapshot_debounce(
+    rpt_handle: DeviceHandle,
+) -> None:
+    """A caller's stricter age limit always causes a deduplicated one-shot."""
+    rpt_handle._last_report_data_at = time.monotonic() - 10.0
+
+    async def enqueue_report_refresh() -> None:
+        asyncio.get_running_loop().call_soon(_feed_report, rpt_handle)
+
+    rpt_handle._enqueue_report_refresh = AsyncMock(side_effect=enqueue_report_refresh)
+    rpt_handle.request_report_snapshot = AsyncMock()
+
+    assert await rpt_handle.ensure_fresh_report_data(max_age_s=5.0, timeout=0.1)
+    rpt_handle._enqueue_report_refresh.assert_awaited_once()
+    rpt_handle.request_report_snapshot.assert_not_awaited()
+
+
+async def test_ensure_fresh_report_data_recovers_continuous_ble_stream(
+    rpt_handle: DeviceHandle,
+) -> None:
+    """A stale continuous stream is restarted without sending count=1."""
+    rpt_handle._ble_stream_active = True
+
+    async def restart() -> None:
+        asyncio.get_running_loop().call_soon(_feed_report, rpt_handle)
+
+    rpt_handle._enqueue_report_refresh = AsyncMock(side_effect=restart)
+
+    assert await rpt_handle.ensure_fresh_report_data(max_age_s=0.0, timeout=0.1)
+    rpt_handle._enqueue_report_refresh.assert_awaited_once()
+
+
+async def test_wait_for_report_data_rejects_future_token(rpt_handle: DeviceHandle) -> None:
+    """A token from a different or later handle generation is not fresh."""
+    assert not await rpt_handle.wait_for_report_data(0.1, since=1)
+
+
+async def test_concurrent_freshness_checks_share_one_queued_poll() -> None:
+    """Concurrent stale checks enqueue only one quota-consuming report request."""
+    handle = make_handle()
+    first = asyncio.create_task(handle.ensure_fresh_report_data(max_age_s=0.0, timeout=1.0))
+    second = asyncio.create_task(handle.ensure_fresh_report_data(max_age_s=0.0, timeout=1.0))
+    await asyncio.sleep(0)
+
+    assert handle.queue._queue.qsize() == 1  # noqa: SLF001
+
+    _feed_report(handle)
+    assert await asyncio.gather(first, second) == [True, True]
+
+
+async def test_freshness_refresh_waits_for_active_saga() -> None:
+    """An explicit freshness request runs after exclusive work releases."""
+    handle = make_handle()
+    handle.queue._exclusive_active.clear()  # noqa: SLF001
+
+    async def send_verified(*_args: object, **_kwargs: object) -> bool:
+        _feed_report(handle)
+        return True
+
+    handle._send_rpt_start_verified = AsyncMock(side_effect=send_verified)
+    waiter = asyncio.create_task(handle.ensure_fresh_report_data(max_age_s=0.0, timeout=0.2))
+    await asyncio.sleep(0)
+
+    assert handle.queue._queue.qsize() == 1  # noqa: SLF001
+
+    handle.queue._exclusive_active.set()  # noqa: SLF001
+    handle.queue.start()
+    assert await waiter
+    handle._send_rpt_start_verified.assert_awaited_once()
+    await handle.queue.stop()
+
+
+async def test_later_freshness_waiter_extends_shared_poll_deadline() -> None:
+    """A short first waiter cannot expire the poll needed by a later waiter."""
+    handle = make_handle()
+    handle.queue.start()
+    handle.queue.pause_for_reconnect()
+
+    async def send_verified(*_args: object, deadline: Callable[[], float], **_kwargs: object) -> bool:
+        assert deadline() > time.monotonic()
+        _feed_report(handle)
+        return True
+
+    handle._send_rpt_start_verified = AsyncMock(side_effect=send_verified)
+
+    first = asyncio.create_task(handle.ensure_fresh_report_data(max_age_s=0.0, timeout=0.01))
+    await asyncio.sleep(0)
+    second = asyncio.create_task(handle.ensure_fresh_report_data(max_age_s=0.0, timeout=0.2))
+    await asyncio.sleep(0.02)
+    assert not await first
+
+    handle.queue.resume_after_reconnect()
+    assert await second
+    handle._send_rpt_start_verified.assert_awaited_once()
+    await handle.queue.stop()
+
+
+async def test_waiter_after_response_gets_follow_up_refresh() -> None:
+    """A waiter starting after a shared response is not attached to that response."""
+    handle = make_handle()
+    handle.queue.start()
+    response_sent = asyncio.Event()
+    release_first = asyncio.Event()
+    calls = 0
+
+    async def send_verified(*_args: object, **_kwargs: object) -> bool:
+        nonlocal calls
+        calls += 1
+        _feed_report(handle)
+        if calls == 1:
+            response_sent.set()
+            await release_first.wait()
+        return True
+
+    handle._send_rpt_start_verified = AsyncMock(side_effect=send_verified)
+
+    first = asyncio.create_task(handle.ensure_fresh_report_data(max_age_s=0.0, timeout=0.2))
+    await response_sent.wait()
+    assert await first
+
+    later = asyncio.create_task(handle.ensure_fresh_report_data(max_age_s=0.0, timeout=0.2))
+    await asyncio.sleep(0)
+    release_first.set()
+
+    assert await later
+    assert calls == 2
+    await handle.queue.stop()
+
+
+async def test_waiter_before_response_shares_in_flight_refresh() -> None:
+    """A waiter joining before the response does not schedule another poll."""
+    handle = make_handle()
+    handle.queue.start()
+    send_started = asyncio.Event()
+    release_response = asyncio.Event()
+    calls = 0
+
+    async def send_verified(*_args: object, **_kwargs: object) -> bool:
+        nonlocal calls
+        calls += 1
+        send_started.set()
+        await release_response.wait()
+        _feed_report(handle)
+        return True
+
+    handle._send_rpt_start_verified = AsyncMock(side_effect=send_verified)
+
+    first = asyncio.create_task(handle.ensure_fresh_report_data(max_age_s=0.0, timeout=0.2))
+    await send_started.wait()
+    second = asyncio.create_task(handle.ensure_fresh_report_data(max_age_s=0.0, timeout=0.2))
+    await asyncio.sleep(0)
+    release_response.set()
+
+    assert await asyncio.gather(first, second) == [True, True]
+    assert calls == 1
+    await handle.queue.stop()
+
+
+async def test_inbound_subscriber_does_not_wait_for_another_report() -> None:
+    """A state subscriber cannot block the transport receive loop on freshness."""
+    from pymammotion.data.model.device import MowerDevice
+    from pymammotion.proto import LubaMsg, MctlSys, ReportInfoData, RptDevStatus
+
+    handle = DeviceHandle(
+        device_id="dev-inbound-freshness",
+        device_name="Luba-Inbound",
+        initial_device=MowerDevice(name="Luba-Inbound"),
+    )
+    handle._enqueue_report_refresh = AsyncMock()
+    results: list[bool] = []
+
+    async def request_from_subscriber(_snapshot: object) -> None:
+        results.append(await handle.ensure_fresh_report_data(max_age_s=0.0, timeout=1.0))
+
+    handle.subscribe_state_changed(request_from_subscriber)
+    msg = LubaMsg(sys=MctlSys(toapp_report_data=ReportInfoData(dev=RptDevStatus(battery_val=42))))
+
+    await asyncio.wait_for(handle.on_raw_message(bytes(msg)), timeout=0.1)
+
+    assert results == [False]
+    handle._enqueue_report_refresh.assert_awaited_once()
+
+
+async def test_state_subscriber_cannot_wait_directly_for_another_report() -> None:
+    """The public waiter cannot deadlock an inline state callback."""
+    handle = make_handle()
+    results: list[bool] = []
+
+    async def request_from_subscriber(_snapshot: object) -> None:
+        results.append(await handle.wait_for_report_data(1.0, since=handle.report_data_token))
+
+    handle.subscribe_state_changed(request_from_subscriber)
+
+    await asyncio.wait_for(handle.emit_state_changed(handle.snapshot), timeout=0.1)
+
+    assert results == [False]
+
+
+async def test_satisfied_queued_report_refresh_does_not_send() -> None:
+    """Unsolicited telemetry makes a delayed report request obsolete."""
+    handle = make_handle()
+    handle.queue.start()
+    handle.queue.pause_for_reconnect()
+    handle._send_rpt_start_verified = AsyncMock()
+
+    waiter = asyncio.create_task(handle.ensure_fresh_report_data(max_age_s=0.0, timeout=0.2))
+    await asyncio.sleep(0)
+    assert handle.queue._queue.qsize() == 1  # noqa: SLF001
+
+    _feed_report(handle)
+    assert await waiter
+    handle.queue.resume_after_reconnect()
+    await asyncio.sleep(0)
+
+    handle._send_rpt_start_verified.assert_not_awaited()
+    await handle.queue.stop()
+
+
+async def test_report_refresh_rechecks_transport_when_dispatched() -> None:
+    """A queued BLE refresh falls back to MQTT if BLE disconnects meanwhile."""
+    handle = make_handle()
+    ble = make_transport(TransportType.BLE, connected=True)
+    mqtt = make_transport(TransportType.CLOUD_ALIYUN, connected=True)
+    await handle.add_transport(ble)
+    await handle.add_transport(mqtt)
+    handle._ble_stream_active = True
+    handle.queue.start()
+    handle.queue.pause_for_reconnect()
+    used_send_raw = False
+
+    async def send_verified(
+        _cmd: bytes,
+        transport_send: Callable[[bytes], Awaitable[None]],
+        *_args: object,
+        **_kwargs: object,
+    ) -> bool:
+        nonlocal used_send_raw
+        used_send_raw = getattr(transport_send, "__self__", None) is handle
+        _feed_report(handle)
+        return True
+
+    handle._send_rpt_start_verified = AsyncMock(side_effect=send_verified)
+    waiter = asyncio.create_task(handle.ensure_fresh_report_data(max_age_s=0.0, timeout=0.2))
+    await asyncio.sleep(0)
+    ble.is_connected = False
+    handle.queue.resume_after_reconnect()
+
+    assert await waiter
+    assert used_send_raw
+    await handle.queue.stop()
+
+
+async def test_unsupported_device_does_not_request_mower_report() -> None:
+    """RTK and pool handles do not speak the mower report-config protocol."""
+    handle = make_handle()
+    handle._skips_activity_loops = True
+    handle._send_one_shot_report = AsyncMock()
+
+    assert not await handle.ensure_fresh_report_data(max_age_s=0.0, timeout=0.1)
+    handle._send_one_shot_report.assert_not_awaited()
 
 
 @pytest.fixture(autouse=True)
@@ -1004,7 +1336,7 @@ def _fast_ack_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
 
 async def test_success_returns_true_and_sends_once(rpt_handle: DeviceHandle) -> None:
     """A report frame during attempt 1 → True, one send, no sync."""
-    cmd_bytes = b"\xBBcmd"
+    cmd_bytes = b"\xbbcmd"
     sync_fn = AsyncMock()
 
     async def transport_send(_payload: bytes) -> None:
@@ -1021,7 +1353,7 @@ async def test_success_returns_true_and_sends_once(rpt_handle: DeviceHandle) -> 
 
 async def test_retry_syncs_before_resending(rpt_handle: DeviceHandle) -> None:
     """Attempt 1 draws nothing → re-sync, then re-send; report on attempt 2 → True."""
-    cmd_bytes = b"\xBBcmd"
+    cmd_bytes = b"\xbbcmd"
     calls: list[str] = []
 
     async def sync_fn() -> None:
@@ -1038,9 +1370,24 @@ async def test_retry_syncs_before_resending(rpt_handle: DeviceHandle) -> None:
     assert calls == ["cmd", "sync", "cmd"], f"Send order wrong; got {calls!r}"
 
 
+async def test_first_send_timeout_retries(rpt_handle: DeviceHandle) -> None:
+    """A transport timeout on attempt one does not suppress attempt two."""
+    calls = 0
+
+    async def transport_send(_payload: bytes) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise TimeoutError
+        _feed_report(rpt_handle)
+
+    assert await rpt_handle._send_rpt_start_verified(b"\xbbcmd", transport_send, AsyncMock())
+    assert calls == 2
+
+
 async def test_no_report_after_both_attempts_returns_false(rpt_handle: DeviceHandle) -> None:
     """Neither attempt draws a report frame → False, no raise, two sends."""
-    cmd_bytes = b"\xBBcmd"
+    cmd_bytes = b"\xbbcmd"
     transport_send = AsyncMock()
 
     result = await rpt_handle._send_rpt_start_verified(cmd_bytes, transport_send, AsyncMock())
@@ -1051,7 +1398,7 @@ async def test_no_report_after_both_attempts_returns_false(rpt_handle: DeviceHan
 
 async def test_sync_failure_does_not_abort_retry(rpt_handle: DeviceHandle) -> None:
     """A flaky re-sync must not block the retry send itself."""
-    cmd_bytes = b"\xBBcmd"
+    cmd_bytes = b"\xbbcmd"
     sync_fn = AsyncMock(side_effect=RuntimeError("flaky sync write"))
 
     async def transport_send(_payload: bytes) -> None:
@@ -1076,7 +1423,7 @@ async def test_defaults_to_quota_free_force_sync(rpt_handle: DeviceHandle, monke
     monkeypatch.setattr(DeviceHandle, "_force_sync", forced)
     transport_send = AsyncMock()
 
-    result = await rpt_handle._send_rpt_start_verified(b"\xBBcmd", transport_send)
+    result = await rpt_handle._send_rpt_start_verified(b"\xbbcmd", transport_send)
 
     assert result is False
     forced.assert_awaited_once()
@@ -1089,7 +1436,7 @@ async def test_frame_already_in_flight_counts(rpt_handle: DeviceHandle) -> None:
     request was registered did not resolve it, so a healthily-streaming device still ate
     a redundant retry.
     """
-    cmd_bytes = b"\xBBcmd"
+    cmd_bytes = b"\xbbcmd"
 
     async def transport_send(_payload: bytes) -> None:
         asyncio.get_running_loop().call_soon(_feed_report, rpt_handle)
@@ -1164,8 +1511,7 @@ def test_identical_selections_emit_one_log_line(dedup_handle: DeviceHandle, capl
         r for r in caplog.records if "selected" in r.getMessage() and "active_transport" in r.getMessage()
     ]
     assert len(selection_lines) == 1, (
-        f"Expected 1 selection log line, got {len(selection_lines)}.  "
-        f"The de-dupe in active_transport regressed."
+        f"Expected 1 selection log line, got {len(selection_lines)}.  The de-dupe in active_transport regressed."
     )
 
 
@@ -1187,19 +1533,15 @@ def test_state_transition_re_emits_log(dedup_handle: DeviceHandle, caplog: pytes
 
     # Snapshot rule-match logs from these three calls (no error path yet).
     rule_lines = [
-        r for r in caplog.records
+        r
+        for r in caplog.records
         if r.name == "pymammotion.device.handle"
-        and (
-            "BLE preferred" in r.getMessage()
-            or "selected " in r.getMessage()
-            or "MQTT unusable" in r.getMessage()
-        )
+        and ("BLE preferred" in r.getMessage() or "selected " in r.getMessage() or "MQTT unusable" in r.getMessage())
     ]
     # Expect exactly 2 transitions logged: (1) BLE-unusable-fallback,
     # (2) BLE-usable.  The repeat in between is suppressed.
     assert len(rule_lines) == 2, (
-        f"Expected 2 transition logs, got {len(rule_lines)}.  "
-        f"Messages: {[r.getMessage() for r in rule_lines]}"
+        f"Expected 2 transition logs, got {len(rule_lines)}.  Messages: {[r.getMessage() for r in rule_lines]}"
     )
 
     # Sanity: when both transports go unusable, active_transport raises
@@ -1223,8 +1565,7 @@ def test_prefer_ble_change_is_a_transition(dedup_handle: DeviceHandle, caplog: p
     dedup_handle.active_transport(prefer_ble=True)  # back to BLE preferred + fallback
 
     rule_lines = [
-        r for r in caplog.records
-        if "BLE preferred but not usable" in r.getMessage() or "selected " in r.getMessage()
+        r for r in caplog.records if "BLE preferred but not usable" in r.getMessage() or "selected " in r.getMessage()
     ]
     # 3 distinct (selection-path, prefer_ble) combinations → at least 3 logs
     assert len(rule_lines) >= 3
@@ -1359,9 +1700,9 @@ async def test_wifi_only_send_uses_mqtt() -> None:
     mqtt = _make_transport(TransportType.CLOUD_ALIYUN, connected=True)
     await handle.add_transport(mqtt)
 
-    await handle.send_raw(b"\xAB\xCD")
+    await handle.send_raw(b"\xab\xcd")
 
-    mqtt.send.assert_awaited_once_with(b"\xAB\xCD", iot_id="", firmware_version=ANY)
+    mqtt.send.assert_awaited_once_with(b"\xab\xcd", iot_id="", firmware_version=ANY)
 
 
 # ---------------------------------------------------------------------------
@@ -1418,10 +1759,10 @@ async def test_hybrid_ble_disconnected_reconnects_in_background_when_no_mqtt() -
     ble.connect.side_effect = _do_connect
     await handle.add_transport(ble)
 
-    await handle.send_raw(b"\xDE\xAD", prefer_ble=True)
+    await handle.send_raw(b"\xde\xad", prefer_ble=True)
     await asyncio.sleep(0)  # let the background connect task run
 
-    ble.send.assert_awaited_once_with(b"\xDE\xAD", iot_id="", firmware_version=ANY)
+    ble.send.assert_awaited_once_with(b"\xde\xad", iot_id="", firmware_version=ANY)
     ble.connect.assert_awaited_once()  # reconnect attempted in the background
 
 
@@ -1598,7 +1939,7 @@ def transport():
 
 def _make_event_envelope(envelope_time_ms: int, identifier: str = "device_protobuf_msg_event") -> bytes:
     """Build a raw JSON thing/events envelope with the given params.time."""
-    sample_bytes = b'\x08\xf4\x01\x10\x01\x18\x07(\x010\x01R\x08\xba\x02\x05\x12\x03\x08\x05\x10K'
+    sample_bytes = b"\x08\xf4\x01\x10\x01\x18\x07(\x010\x01R\x08\xba\x02\x05\x12\x03\x08\x05\x10K"
     encoded = base64.b64encode(sample_bytes).decode("ascii")
 
     payload = {
