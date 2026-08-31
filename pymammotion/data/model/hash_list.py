@@ -907,6 +907,33 @@ class HashList(DataClassORJSONMixin):
             self.current_mow_path[transaction_id] = {}
         self.current_mow_path[transaction_id][path.current_frame] = path
 
+    def commit_mow_path_transactions(
+        self,
+        transactions: dict[int, dict[int, MowPath]],
+        *,
+        replace: bool = False,
+    ) -> None:
+        """Publish complete cover-path transactions as one state update."""
+        incomplete = {
+            transaction_id
+            for transaction_id, frames in transactions.items()
+            if not self.mow_path_transaction_complete(frames)
+        }
+        if incomplete:
+            msg = f"cannot commit incomplete mow-path transactions: {sorted(incomplete)}"
+            raise ValueError(msg)
+        self.current_mow_path = dict(transactions) if replace else {**self.current_mow_path, **transactions}
+
+    @staticmethod
+    def mow_path_transaction_complete(frames: dict[int, MowPath]) -> bool:
+        """Return whether *frames* contains one complete, successful transaction."""
+        if not frames:
+            return False
+        expected_total = next(iter(frames.values())).total_frame
+        if expected_total <= 0 or set(frames) != set(range(1, expected_total + 1)):
+            return False
+        return all(frame.result == 0 and frame.total_frame == expected_total for frame in frames.values())
+
     def upsert_edge_frame(
         self,
         hash_key: int,

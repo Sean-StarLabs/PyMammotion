@@ -9,12 +9,14 @@ be distinct instances so mutations through one do not leak to the other.
 from __future__ import annotations
 
 from pymammotion.data.model.device import MowerDevice
-from pymammotion.data.model.hash_list import AreaHashNameList
+from pymammotion.data.model.hash_list import AreaHashNameList, MowPath
 from pymammotion.device.state_reducer import MowerStateReducer
 from pymammotion.proto import (
     LubaMsg,
     MctlNav,
+    CoverPathUploadT,
     NavGetAllPlanTask,
+    NavGetHashListAck,
     NavReqCoverPath,
     NavSysParamMsg,
     NavUnableTimeSet,
@@ -95,6 +97,67 @@ def test_bidire_reqconver_path_copies_nothing_but_rebinds_work() -> None:
     # But device.work was rebuilt by the handler and current.work is untouched
     assert updated.work is not original_work
     assert current.work is original_work
+
+
+def test_cover_path_saga_keeps_partial_frames_out_of_device_state() -> None:
+    """The atomic saga owns cover-path frames until it commits a complete transfer."""
+    reducer = MowerStateReducer()
+    current = _make_device()
+    current.map.current_mow_path = {10: {1: MowPath(transaction_id=10, current_frame=1, total_frame=1)}}
+    msg = LubaMsg(
+        nav=MctlNav(
+            cover_path_upload=CoverPathUploadT(
+                transaction_id=20,
+                current_frame=1,
+                total_frame=2,
+            )
+        )
+    )
+
+    updated = reducer.apply(current, msg)
+
+    assert updated.map is current.map
+    assert 20 not in updated.map.current_mow_path
+
+
+def test_unsolicited_cover_path_does_not_mutate_device_state() -> None:
+    """Delayed cover frames cannot bypass the saga's atomic commit."""
+    reducer = MowerStateReducer()
+    current = _make_device()
+    msg = LubaMsg(
+        nav=MctlNav(
+            cover_path_upload=CoverPathUploadT(
+                transaction_id=20,
+                current_frame=1,
+                total_frame=1,
+            )
+        )
+    )
+
+    updated = reducer.apply(current, msg)
+
+    assert updated.map is current.map
+    assert 20 not in updated.map.current_mow_path
+
+
+def test_route_manifest_frames_remain_private_to_atomic_saga() -> None:
+    """A partial route manifest must not enter published device state."""
+    reducer = MowerStateReducer()
+    current = _make_device()
+    msg = LubaMsg(
+        nav=MctlNav(
+            toapp_gethash_ack=NavGetHashListAck(
+                sub_cmd=3,
+                total_frame=2,
+                current_frame=1,
+                data_couple=[123],
+            )
+        )
+    )
+
+    updated = reducer.apply(current, msg)
+
+    assert updated.map.root_hash_lists == []
 
 
 
