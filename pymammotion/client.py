@@ -2343,12 +2343,9 @@ class MammotionClient:
 
         """
         if handle := self._device_registry.get_by_name(device_name):
-            # MQTT-only gate: skip when mow_path_fetch_enabled is False AND BLE
-            # isn't actively connected (so this would go over MQTT).  BLE-routed
-            # fetches always run.
-            if not handle.mow_path_fetch_enabled and not handle.is_transport_connected(TransportType.BLE):
+            if not handle.mow_path_fetch_enabled:
                 _logger.debug(
-                    "start_mow_path_saga '%s': mow_path_fetch_enabled=False over MQTT — skipping",
+                    "start_mow_path_saga '%s': mow_path_fetch_enabled=False — skipping",
                     device_name,
                 )
                 return
@@ -2789,11 +2786,7 @@ class MammotionClient:
             handle.set_prefer_ble(value=prefer_ble)
 
     def set_mow_path_fetch_enabled(self, device_id: str, *, enabled: bool) -> None:
-        """Toggle the MQTT-side mow path fetch gate for a registered device.
-
-        When False, MowPathSaga is skipped for any send that would go over
-        MQTT.  BLE-routed fetches always run regardless.
-        """
+        """Enable or disable native mow-path fetching for a registered device."""
         handle = self._device_registry.get(device_id)
         if handle is not None:
             handle.set_mow_path_fetch_enabled(value=enabled)
