@@ -97,6 +97,7 @@ class MowPathSaga(Saga):
         self._zone_hashs = zone_hashs
         self._route_info = route_info
         self._skip_planning = skip_planning
+        self.interruptible = skip_planning
         self._device_name = device_name
         self._sync_type = sync_type  # 2 = BLE, 3 = IoT/MQTT
         self._next_transaction_id = next_transaction_id
