@@ -562,6 +562,22 @@ class TestUpdateHashLists:
         hl.update_hash_lists([100])
         assert hl.area_name == [AreaHashNameList(name="Front", hash=100)]
 
+    def test_invalidating_map_clears_authoritative_area_manifest(self) -> None:
+        hl = HashList(area_manifest_hashes={100})
+        hl.update_root_hash_list(_root([100]))
+
+        hl.invalidate_maps(12345)
+
+        assert hl.area_manifest_hashes is None
+
+    def test_authoritative_area_manifest_is_not_persisted(self) -> None:
+        hl = HashList(area_manifest_hashes={100})
+
+        restored = HashList.from_dict(json.loads(json.dumps(hl.to_dict())))
+
+        assert "area_manifest_hashes" not in hl.to_dict()
+        assert restored.area_manifest_hashes is None
+
 
 # ---------------------------------------------------------------------------
 # HashList.invalidate_breakpoint_line
