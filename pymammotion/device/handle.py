@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import copy
 import dataclasses
 import logging
 import time
@@ -91,6 +92,7 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
     from pymammotion.data.model.device import Device, MowingDevice
+    from pymammotion.data.model.hash_list import MowPath, RootHashList
     from pymammotion.data.mqtt.event import ThingEventMessage
     from pymammotion.data.mqtt.properties import MammotionPropertiesMessage, ThingPropertiesMessage
     from pymammotion.data.mqtt.status import ThingStatusMessage
@@ -233,7 +235,10 @@ class DeviceHandle:
         # full mower reducer. Decided once at construction so the per-message
         # hot path doesn't pay an isinstance check.  The saga-active callable
         # lets the reducer skip eager geojson regen during map fetches.
-        self._reducer: StateReducer = get_state_reducer(device_name, is_saga_active=lambda: self.queue.is_saga_active)
+        self._reducer: StateReducer = get_state_reducer(
+            device_name,
+            is_saga_active=lambda: self.queue.is_saga_active,
+        )
         self._error_bus: EventBus[Exception] = EventBus()
         self._map_updated_bus: EventBus[None] = EventBus()
         self._shutdown_bus: EventBus[DeviceShutdownEvent] = EventBus()
@@ -307,6 +312,7 @@ class DeviceHandle:
         self._last_report_data_at: float = 0.0
         #: Signalled on each such frame so waiters don't have to poll the timestamp.
         self._report_data_event: asyncio.Event = asyncio.Event()
+        self._last_route_transaction_id = 0
         # Wire up critical error propagation from queue
         self.queue.on_critical_error = self._on_critical_error
 
@@ -330,6 +336,12 @@ class DeviceHandle:
     def commands(self) -> MammotionCommand:
         """Return a MammotionCommand builder for this device."""
         return MammotionCommand(self.device_name, self.user_account)
+
+    def next_route_transaction_id(self) -> int:
+        """Return a strictly increasing route transaction ID for this device."""
+        transaction_id = max(int(time.time() * 1000), self._last_route_transaction_id + 1)
+        self._last_route_transaction_id = transaction_id
+        return transaction_id
 
     def _wire_transport(self, transport: Transport) -> None:
         """Wire callbacks on a transport and register it."""
@@ -868,6 +880,32 @@ class DeviceHandle:
     ) -> None:
         """Enqueue a saga for exclusive execution."""
         await self.queue.enqueue_saga(saga, self.broker, on_complete=on_complete)
+
+    async def commit_mow_path_transactions(
+        self,
+        transactions: dict[int, dict[int, MowPath]],
+        *,
+        replace: bool = False,
+        line_hash_list: RootHashList | None = None,
+    ) -> bool:
+        """Commit complete cover-path data through the device state pipeline."""
+        current = self.state_machine.current.raw
+        if not isinstance(current, MowerDevice):
+            return False
+        updated = dataclasses.replace(current)
+        updated.map = copy.deepcopy(current.map)
+        if line_hash_list is not None:
+            updated.map.root_hash_lists = [
+                root for root in updated.map.root_hash_lists if root.sub_cmd != line_hash_list.sub_cmd
+            ]
+            if line_hash_list.data:
+                updated.map.root_hash_lists.append(line_hash_list)
+        updated.map.commit_mow_path_transactions(transactions, replace=replace)
+        if updated.location.RTK.latitude != 0.0:
+            updated.map.generate_mowing_geojson(updated.location.RTK)
+        snapshot, _ = self.state_machine.apply(updated, self._availability)
+        await self.emit_state_changed(snapshot)
+        return True
 
     def has_queued_commands(self) -> bool:
         """Return True if the queue has pending work or a saga is active."""

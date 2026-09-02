@@ -23,6 +23,7 @@ from pymammotion.data.model.hash_list import (
     NavGetCommData,
     NavGetHashListData,
     NavNameTime,
+    MowPath,
     PathType,
 )
 
@@ -76,6 +77,52 @@ def _hash_list_with_lines(*line_hashes: int) -> HashList:
     for h in line_hashes:
         hl.line[h] = _line_frame(h)
     return hl
+
+
+def test_commit_mow_path_transactions_is_atomic() -> None:
+    """Only complete successful transactions can become visible state."""
+    hash_list = HashList()
+    existing = MowPath(transaction_id=10, current_frame=1, total_frame=1)
+    hash_list.current_mow_path = {10: {1: existing}}
+    complete = {
+        20: {
+            1: MowPath(transaction_id=20, current_frame=1, total_frame=2),
+            2: MowPath(transaction_id=20, current_frame=2, total_frame=2),
+        }
+    }
+
+    hash_list.commit_mow_path_transactions(complete)
+
+    assert hash_list.current_mow_path == {10: {1: existing}, **complete}
+
+
+def test_commit_mow_path_transactions_replaces_previous_preview() -> None:
+    """A newly planned route replaces transactions from an older preview."""
+    hash_list = HashList()
+    old = MowPath(transaction_id=10, current_frame=1, total_frame=1, result=0)
+    new = MowPath(transaction_id=20, current_frame=1, total_frame=1, result=0)
+    hash_list.current_mow_path = {10: {1: old}}
+
+    hash_list.commit_mow_path_transactions({20: {1: new}}, replace=True)
+
+    assert hash_list.current_mow_path == {20: {1: new}}
+
+
+def test_commit_mow_path_transactions_rejects_partial_state() -> None:
+    """A partial transfer leaves the previously published route untouched."""
+    hash_list = HashList()
+    existing = {10: {1: MowPath(transaction_id=10, current_frame=1, total_frame=1)}}
+    hash_list.current_mow_path = existing
+    partial = {20: {1: MowPath(transaction_id=20, current_frame=1, total_frame=2)}}
+
+    try:
+        hash_list.commit_mow_path_transactions(partial)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("partial transaction was accepted")
+
+    assert hash_list.current_mow_path == existing
 
 
 # ---------------------------------------------------------------------------
@@ -162,11 +209,13 @@ class TestAreaOnly:
         assert result[0].hash == 10
 
     def test_multiple_unnamed_areas_numbered_sequentially(self) -> None:
-        hl = _make_hash_list(area={
-            10: _make_empty_frame_list(),
-            20: _make_empty_frame_list(),
-            30: _make_empty_frame_list(),
-        })
+        hl = _make_hash_list(
+            area={
+                10: _make_empty_frame_list(),
+                20: _make_empty_frame_list(),
+                30: _make_empty_frame_list(),
+            }
+        )
         result = hl.computed_areas
         names = {a.name for a in result}
         assert names == {"Area 1", "Area 2", "Area 3"}
@@ -411,9 +460,7 @@ class TestUpsertAreaName:
         assert hl.area_name == [AreaHashNameList(name="Front Lawn", hash=123)]
 
     def test_update_in_place_when_hash_present(self) -> None:
-        hl = _make_hash_list(
-            area_name=[AreaHashNameList(name="Front Lawn", hash=123)]
-        )
+        hl = _make_hash_list(area_name=[AreaHashNameList(name="Front Lawn", hash=123)])
         hl.upsert_area_name(123, "Back Lawn")
         # Same single entry, name replaced — no duplicate appended.
         assert hl.area_name == [AreaHashNameList(name="Back Lawn", hash=123)]
