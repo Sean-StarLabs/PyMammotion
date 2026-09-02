@@ -126,6 +126,7 @@ class MapFetchSaga(Saga):
     async def _run(self, broker: DeviceMessageBroker) -> None:
         """Execute all saga steps.  Uses device.map (via get_map) as the source of truth."""
         self.result = None
+        self._get_map().area_manifest_hashes = None
 
         # Start-of-run staleness check: if the device's reported bol_hash no longer
         # matches our stored root manifest, the map was edited device-side since we
@@ -198,7 +199,7 @@ class MapFetchSaga(Saga):
                     )
                 )
 
-            await ack_stream(
+            root_frames = await ack_stream(
                 hash_frame_queue,
                 field="toapp_gethash_ack",
                 ack=_ack,
@@ -243,12 +244,6 @@ class MapFetchSaga(Saga):
             # the missing frames from scratch.
             missing_hashes = self._get_map().find_incomplete_hashes(0)
             current_hash: int | None = None
-            # Saga-local tracker of hashes whose `current_frame == total_frame`
-            # transaction we've observed.  Used to advance current_hash even
-            # when ``find_incomplete_hashes`` doesn't realise a hash is done
-            # (e.g. radar-only types like 23 that have no PathType entry).
-            addressed_hashes: set[int] = set()
-
             if missing_hashes:
                 # Re-sync before the first per-hash request for the same reason as the
                 # root-list step — keep the device responsive when step 4 begins.
@@ -286,18 +281,10 @@ class MapFetchSaga(Saga):
                 if not self._in_scope(leaf_name, leaf_val, missing_hashes, current_hash):
                     continue
 
-                # Track per-hash completion locally so the advancement decision doesn't
-                # rely solely on find_incomplete_hashes (which can miss radar/unknown
-                # types — see addressed_hashes init comment).
-                frame_hash, parent_hash = self._frame_scope_hashes(leaf_name, leaf_val)
-                if leaf_val.current_frame >= leaf_val.total_frame and leaf_val.total_frame > 0:
-                    addressed_hashes.add(frame_hash)
-                    if leaf_name == "toapp_svg_msg":
-                        addressed_hashes.add(parent_hash)
-
-                if self._get_map().missing_frame(leaf_val):
+                if not self._get_map().has_complete_frame_list(leaf_val):
                     # More frames still needed for this transaction — the device sends
-                    # the next one in response to the ack above.
+                    # the next one in response to the ack above. Untracked placeholders,
+                    # such as common-data SVG frames, cannot prove completion either.
                     continue
 
                 # Data item complete.  Drain any sibling frames for current_hash already
@@ -305,10 +292,9 @@ class MapFetchSaga(Saga):
                 # doesn't advance current_hash before the SVG tile is processed.
                 await self._drain_current_hash_frames(comm_queue, current_hash)
 
-                # Check whether the whole hash is done.  Filter find_incomplete_hashes by
-                # addressed_hashes so a hash whose only frame had an unknown type (e.g.
-                # radar type=23) doesn't keep us pinned to the same current_hash.
-                new_missing = [h for h in self._get_map().find_incomplete_hashes(0) if h not in addressed_hashes]
+                # Check whole-hash completeness, including every boundary and
+                # associated SVG transfer. Unknown types are tracked by HashList too.
+                new_missing = self._get_map().find_incomplete_hashes(0)
                 if len(new_missing) < len(missing_hashes):
                     no_progress = 0
                 else:
@@ -336,6 +322,16 @@ class MapFetchSaga(Saga):
                 self._device_name,
                 len(current_map.area_name),
             )
+
+        accepted_area_hashes = {
+            int(area_hash)
+            for frame in root_frames.values()
+            for area_hash in frame.data_couple
+            if int(area_hash) != 0
+        }
+        current_map.area_manifest_hashes = accepted_area_hashes.intersection(
+            current_map.area
+        )
 
         _logger.debug(
             "MapFetchSaga[%s]: map fetch complete — areas=%d obstacles=%d paths=%d",

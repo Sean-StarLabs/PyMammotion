@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any
 
+from mashumaro import field_options
 from mashumaro.mixins.orjson import DataClassORJSONMixin
 from shapely import Point
 
@@ -409,6 +410,11 @@ class HashList(DataClassORJSONMixin):
     no_go_zone: dict[int, FrameList] = field(default_factory=dict)  # type 23
     plan: dict[str, Plan] = field(default_factory=dict)
     area_name: list[AreaHashNameList] = field(default_factory=list)
+    area_manifest_hashes: set[int] | None = field(
+        default=None,
+        metadata=field_options(serialize="omit"),
+    )
+    """Area hashes committed by the latest successful map fetch in this process."""
     current_mow_path: dict[int, dict[int, MowPath]] = field(default_factory=dict)
     generated_geojson: dict[str, Any] = field(default_factory=dict)
     geojson_yaw: float = 0.0  # RTK yaw (radians) used when generated_geojson was last built
@@ -771,6 +777,11 @@ class HashList(DataClassORJSONMixin):
         frame_list = self._get_frame_list_by_type_and_hash(hash_data)
         return self.find_missing_frames(frame_list)
 
+    def has_complete_frame_list(self, hash_data: NavGetCommDataAck | SvgMessageAckT) -> bool:
+        """Return whether *hash_data* belongs to a tracked, complete transfer."""
+        frame_list = self._get_frame_list_by_type_and_hash(hash_data)
+        return frame_list is not None and not self.find_missing_frames(frame_list)
+
     def _get_frame_list_by_type_and_hash(
         self, hash_data: NavGetCommDataAck | SvgMessageAckT
     ) -> FrameList | SvgFrameList | None:
@@ -785,7 +796,9 @@ class HashList(DataClassORJSONMixin):
         path_type_mapping = self._get_path_type_mapping()
         target_dict = path_type_mapping.get(hash_data.type)
         if target_dict is None:
-            return None
+            target_dict = self.unknown_type_frames.get(hash_data.type)
+            if target_dict is None:
+                return None
         return target_dict.get(hash_data.hash)
 
     def update_plan(self, plan: Plan) -> None:
@@ -1044,6 +1057,7 @@ class HashList(DataClassORJSONMixin):
         """
         if bol_hash is None or self.computed_bol_hash == bol_hash:
             return
+        self.area_manifest_hashes = None
         self.root_hash_lists = [rl for rl in self.root_hash_lists if rl.sub_cmd != 0]
         self.update_hash_lists(self.hashlist)
 
