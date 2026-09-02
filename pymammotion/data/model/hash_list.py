@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any
 
+from mashumaro import field_options
 from mashumaro.mixins.orjson import DataClassORJSONMixin
 from shapely import Point
 
@@ -409,6 +410,11 @@ class HashList(DataClassORJSONMixin):
     no_go_zone: dict[int, FrameList] = field(default_factory=dict)  # type 23
     plan: dict[str, Plan] = field(default_factory=dict)
     area_name: list[AreaHashNameList] = field(default_factory=list)
+    area_manifest_hashes: set[int] | None = field(
+        default=None,
+        metadata=field_options(serialize="omit"),
+    )
+    """Area hashes committed by the latest successful map fetch in this process."""
     current_mow_path: dict[int, dict[int, MowPath]] = field(default_factory=dict)
     generated_geojson: dict[str, Any] = field(default_factory=dict)
     geojson_yaw: float = 0.0  # RTK yaw (radians) used when generated_geojson was last built
@@ -1044,6 +1050,7 @@ class HashList(DataClassORJSONMixin):
         """
         if bol_hash is None or self.computed_bol_hash == bol_hash:
             return
+        self.area_manifest_hashes = None
         self.root_hash_lists = [rl for rl in self.root_hash_lists if rl.sub_cmd != 0]
         self.update_hash_lists(self.hashlist)
 
