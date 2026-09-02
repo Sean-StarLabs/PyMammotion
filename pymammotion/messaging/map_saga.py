@@ -126,6 +126,7 @@ class MapFetchSaga(Saga):
     async def _run(self, broker: DeviceMessageBroker) -> None:
         """Execute all saga steps.  Uses device.map (via get_map) as the source of truth."""
         self.result = None
+        self._get_map().area_manifest_hashes = None
 
         # Start-of-run staleness check: if the device's reported bol_hash no longer
         # matches our stored root manifest, the map was edited device-side since we
@@ -198,7 +199,7 @@ class MapFetchSaga(Saga):
                     )
                 )
 
-            await ack_stream(
+            root_frames = await ack_stream(
                 hash_frame_queue,
                 field="toapp_gethash_ack",
                 ack=_ack,
@@ -336,6 +337,16 @@ class MapFetchSaga(Saga):
                 self._device_name,
                 len(current_map.area_name),
             )
+
+        accepted_area_hashes = {
+            int(area_hash)
+            for frame in root_frames.values()
+            for area_hash in frame.data_couple
+            if int(area_hash) != 0
+        }
+        current_map.area_manifest_hashes = accepted_area_hashes.intersection(
+            current_map.area
+        )
 
         _logger.debug(
             "MapFetchSaga[%s]: map fetch complete — areas=%d obstacles=%d paths=%d",
