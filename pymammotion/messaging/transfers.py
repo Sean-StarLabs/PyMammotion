@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING, Any
 
 import betterproto2
 
-from pymammotion.transport.base import CommandTimeoutError
+from pymammotion.transport.base import CommandTimeoutError, SagaInterruptedError
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
@@ -145,6 +145,7 @@ async def ack_stream(
 
     """
     frames: dict[int, Any] = {}
+    expected_total: int | None = None
     while True:
         try:
             frame = await _await_frame(
@@ -160,12 +161,20 @@ async def ack_stream(
                 return {}
             raise
 
-        await ack(frame)
-        frames[frame.current_frame] = frame
-
         total = frame.total_frame
+        current = frame.current_frame
+        if total <= 0 or current <= 0 or current > total:
+            raise SagaInterruptedError(f"{field} returned invalid frame {current}/{total}")
+        if expected_total is None:
+            expected_total = total
+        elif total != expected_total:
+            raise SagaInterruptedError(f"{field} changed total frames from {expected_total} to {total}")
+
+        await ack(frame)
+        frames[current] = frame
+
         _logger.debug("ack_stream(%s): frame %d/%d (%d banked)", field, frame.current_frame, total, len(frames))
-        if total and len(frames) >= total:
+        if set(frames) == set(range(1, expected_total + 1)):
             return frames
 
 
