@@ -280,6 +280,9 @@ class DeviceHandle:
         #: where DeviceType.is_support_dynamics_line() is true.  Mirrors APK
         #: HashDataManager.handlerType_getDynamicsLine.
         self._dynamics_line_task: asyncio.Task[None] | None = None
+        #: Wakes the trail loop when BLE availability changes so it can switch
+        #: cadence without waiting out a cloud-only polling interval.
+        self._dynamics_line_rearm_event: asyncio.Event = asyncio.Event()
         #: Background BLE-connect task and its single-flight lock.  ``send_raw`` / ``_do_send``
         #: kick a background reconnect when BLE is preferred-but-disconnected; the lock keeps
         #: only one connect running at a time (bursts of sends must not spawn concurrent
@@ -375,6 +378,7 @@ class DeviceHandle:
             # state from the flap itself, only from cloud "offline" reports / inbound frames.
             self.update_availability(transport_type, state)
             if transport_type == TransportType.BLE:
+                self._dynamics_line_rearm_event.set()
                 if state == TransportAvailability.CONNECTED:
                     # BLE arriving while MQTT is reconnecting provides a fallback send path —
                     # open the queue gate so commands can flow immediately over BLE.
@@ -399,11 +403,6 @@ class DeviceHandle:
                         task = self._ble_polling_task
                         if task is not None and not task.done():
                             task.cancel()
-                        # Dynamics-line polling is BLE-only — cancel here so it
-                        # restarts cleanly on the next _on_ble_connected.
-                        dl_task = self._dynamics_line_task
-                        if dl_task is not None and not dl_task.done():
-                            dl_task.cancel()
                         self._ble_stream_active = False
             elif state == TransportAvailability.CONNECTING:
                 # MQTT subscription is not yet active — commands sent now would time
@@ -1213,9 +1212,7 @@ class DeviceHandle:
         self.queue.start()
         if not self._skips_activity_loops and (self._keep_alive_task is None or self._keep_alive_task.done()):
             self._keep_alive_task = asyncio.get_running_loop().create_task(mqtt_activity_loop(self))
-        # _dynamics_line_task is BLE-gated and starts/stops from _on_ble_connected
-        # / the BLE availability handler — not from start().  Dynamics-line polling
-        # only makes sense over BLE (10 s cadence would be MQTT-quota-expensive).
+        self._start_dynamics_line_loop()
 
     def _start_ble_loop(self) -> None:
         """Start (or restart) the BLE heartbeat task if not already running."""
@@ -1236,10 +1233,10 @@ class DeviceHandle:
     def _start_dynamics_line_loop(self) -> None:
         """Start (or restart) the dynamics-line poll loop if the device type supports it.
 
-        BLE-gated — only called from ``_on_ble_connected``.  Skipped entirely for
-        device types that can never support dynamics line; LUBA_VA is included
-        because its eligibility flips on firmware >= 1.15.3.4422, which the loop
-        re-checks on every tick using the live ``main_controller`` version.
+        Skipped entirely for device types that can never support dynamics line;
+        LUBA_VA is included because its eligibility flips on firmware >=
+        1.15.3.4422, which the loop re-checks on every tick using the live
+        ``main_controller`` version.
         """
         if self._skips_activity_loops or self._stopping:
             return
@@ -1260,17 +1257,19 @@ class DeviceHandle:
             self._keep_alive_task = asyncio.get_running_loop().create_task(mqtt_activity_loop(self))
 
     async def stop_polling(self) -> None:
-        """Cancel the MQTT poll loop, leaving the queue and transports running.
+        """Cancel outbound poll loops, leaving the queue and transports running.
 
         The handle stays fully operational for receiving messages — state updates,
         saga results, and user-initiated sends all continue to work.  No outbound
         polls are sent until ``start()`` is called again.
         """
-        if self._keep_alive_task is not None and not self._keep_alive_task.done():
-            self._keep_alive_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._keep_alive_task
+        for task in (self._keep_alive_task, self._dynamics_line_task):
+            if task is not None and not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
         self._keep_alive_task = None
+        self._dynamics_line_task = None
 
     async def stop(self) -> None:
         """Stop the command queue, broker, debounce task, and disconnect all transports."""

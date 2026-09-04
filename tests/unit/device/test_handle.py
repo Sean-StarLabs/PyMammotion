@@ -68,6 +68,22 @@ def make_handle(
     )
 
 
+async def test_stop_polling_cancels_all_outbound_poll_loops() -> None:
+    """Disabling polling also stops cloud-capable native trail requests."""
+    handle = make_handle()
+    keep_alive = asyncio.create_task(asyncio.sleep(60))
+    dynamics_line = asyncio.create_task(asyncio.sleep(60))
+    handle._keep_alive_task = keep_alive  # noqa: SLF001
+    handle._dynamics_line_task = dynamics_line  # noqa: SLF001
+
+    await handle.stop_polling()
+
+    assert keep_alive.cancelled()
+    assert dynamics_line.cancelled()
+    assert handle._keep_alive_task is None  # noqa: SLF001
+    assert handle._dynamics_line_task is None  # noqa: SLF001
+
+
 # ---------------------------------------------------------------------------
 # test 1: add_transport sets on_message
 # ---------------------------------------------------------------------------
@@ -101,6 +117,19 @@ async def test_update_availability_changes_state() -> None:
 
     assert handle.availability.is_available is True
     assert handle.availability.connection_state == DeviceConnectionState.CONNECTED
+
+
+async def test_ble_availability_wakes_dynamics_line_polling() -> None:
+    """BLE topology changes interrupt the cloud-rate trail wait."""
+    handle = make_handle()
+    handle._on_ble_connected = AsyncMock()  # type: ignore[method-assign]
+    callback = handle._make_availability_handler(TransportType.BLE)
+
+    await callback(TransportAvailability.CONNECTED)
+    await asyncio.sleep(0)
+
+    assert handle._dynamics_line_rearm_event.is_set()
+    handle._on_ble_connected.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
