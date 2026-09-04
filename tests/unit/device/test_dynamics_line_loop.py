@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 from pymammotion.data.model.device import MowingDevice
 from pymammotion.data.model.hash_list import CommDataCouple
 from pymammotion.device.dynamics_line_loop import (
+    _DYNAMICS_LINE_CLOUD_POLL_INTERVAL,
+    _DYNAMICS_LINE_POLL_INTERVAL,
     _enqueue_dynamics_line_saga,
     dynamics_line_loop,
 )
@@ -135,4 +137,44 @@ async def test_dynamics_loop_uses_its_own_poll_cadence() -> None:
         await dynamics_line_loop(handle)
 
     sleep.assert_awaited_once()
+    sleep.assert_awaited_once_with(_DYNAMICS_LINE_POLL_INTERVAL)
     handle.sleep_or_rearm.assert_not_awaited()
+
+
+async def test_dynamics_loop_uses_slower_cloud_cadence() -> None:
+    """Cloud-only trail polling preserves the older firmware send budget."""
+    handle, _device = _make_handle(3)
+    handle.device_name = "Yuka-MLYQ73XB"
+    handle._stopping = False
+    handle._transports = {
+        TransportType.BLE: MagicMock(is_connected=False),
+        TransportType.CLOUD_ALIYUN: MagicMock(is_connected=True),
+    }
+    handle.device_mode.return_value = _DeviceMode.ACTIVE
+    handle.queue.is_saga_active = False
+
+    sleep_count = 0
+
+    async def stop_after_one_poll(_seconds: float) -> None:
+        nonlocal sleep_count
+        sleep_count += 1
+        if sleep_count == 2:
+            handle._stopping = True
+
+    with patch(
+        "pymammotion.device.dynamics_line_loop.asyncio.sleep",
+        new_callable=AsyncMock,
+        side_effect=stop_after_one_poll,
+    ) as sleep, patch(
+        "pymammotion.device.dynamics_line_loop._enqueue_dynamics_line_saga",
+        new_callable=AsyncMock,
+    ) as enqueue:
+        await dynamics_line_loop(handle)
+
+    sleep.assert_has_awaits(
+        [
+            call(_DYNAMICS_LINE_CLOUD_POLL_INTERVAL),
+            call(_DYNAMICS_LINE_CLOUD_POLL_INTERVAL),
+        ]
+    )
+    enqueue.assert_awaited_once_with(handle)

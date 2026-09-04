@@ -409,11 +409,6 @@ class DeviceHandle:
                         task = self._ble_polling_task
                         if task is not None and not task.done():
                             task.cancel()
-                        # Dynamics-line polling is BLE-only — cancel here so it
-                        # restarts cleanly on the next _on_ble_connected.
-                        dl_task = self._dynamics_line_task
-                        if dl_task is not None and not dl_task.done():
-                            dl_task.cancel()
                         self._ble_stream_active = False
             elif state == TransportAvailability.CONNECTING:
                 # MQTT subscription is not yet active — commands sent now would time
@@ -1214,9 +1209,7 @@ class DeviceHandle:
         self.queue.start()
         if not self._skips_activity_loops and (self._keep_alive_task is None or self._keep_alive_task.done()):
             self._keep_alive_task = asyncio.get_running_loop().create_task(mqtt_activity_loop(self))
-        # _dynamics_line_task is BLE-gated and starts/stops from _on_ble_connected
-        # / the BLE availability handler — not from start().  Dynamics-line polling
-        # only makes sense over BLE (10 s cadence would be MQTT-quota-expensive).
+        self._start_dynamics_line_loop()
 
     def _start_ble_loop(self) -> None:
         """Start (or restart) the BLE heartbeat task if not already running."""
@@ -1237,10 +1230,10 @@ class DeviceHandle:
     def _start_dynamics_line_loop(self) -> None:
         """Start (or restart) the dynamics-line poll loop if the device type supports it.
 
-        BLE-gated — only called from ``_on_ble_connected``.  Skipped entirely for
-        device types that can never support dynamics line; LUBA_VA is included
-        because its eligibility flips on firmware >= 1.15.3.4422, which the loop
-        re-checks on every tick using the live ``main_controller`` version.
+        Skipped entirely for device types that can never support dynamics line;
+        LUBA_VA is included because its eligibility flips on firmware >=
+        1.15.3.4422, which the loop re-checks on every tick using the live
+        ``main_controller`` version.
         """
         if self._skips_activity_loops or self._stopping:
             return
