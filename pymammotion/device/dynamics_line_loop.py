@@ -6,16 +6,16 @@ device is mowing/returning, for devices where
 response carries the live cut-path so far, which the UI overlays as the
 mower's progress.
 
-This loop replicates that behaviour for pymammotion.  **BLE-gated** — the
-loop is started from ``DeviceHandle._on_ble_connected`` and cancelled when
-BLE disconnects, mirroring the ``_ble_polling_task`` lifecycle.  The 10 s
-cadence would be MQTT-quota-expensive, and BLE is where the responsiveness
-matters anyway (HA users watching live mow progress are typically nearby).
+This loop replicates that behaviour for pymammotion.  It prefers BLE at the
+app's 10 s cadence, but falls back to a slower cloud cadence when the mower is
+outside Bluetooth range.  Native paths are useful precisely while the mower
+is moving around a property, so tying their lifecycle to a nearby BLE link
+would make them disappear during ordinary use.
 
 Per-tick gates:
 
 * device is in ACTIVE mode (``DeviceHandle.device_mode``)
-* BLE transport is still connected
+* at least one transport is connected
 * device type supports dynamics line (re-checked because LUBA_VA is
   firmware-gated and firmware may not be known at loop-start)
 * no other saga is currently running on the device queue
@@ -44,15 +44,14 @@ _logger = logging.getLogger(__name__)
 #: Poll cadence — matches APK ``HashDataManager.handlerType_getDynamicsLine``
 #: (10 000 ms, see ``HashDataManager.java:133, :873``).
 _DYNAMICS_LINE_POLL_INTERVAL: float = 10.0
+#: Cloud requests count toward older firmware's rolling send limit.  One poll
+#: per minute keeps a useful live trail without consuming the budget at the
+#: app's BLE cadence.
+_DYNAMICS_LINE_CLOUD_POLL_INTERVAL: float = 60.0
 
 
 async def dynamics_line_loop(handle: DeviceHandle) -> None:
-    """Periodic dynamics-line poll loop — BLE-gated.
-
-    Started from ``DeviceHandle._on_ble_connected``; cancelled from the BLE
-    availability handler when state transitions to DISCONNECTED.  Self-exits
-    if it observes BLE disconnected mid-tick (defensive against any path that
-    drops BLE without going through the availability handler).
+    """Periodically fetch the native trail over BLE or cloud.
 
     LUBA_VA is firmware-gated (must be >= 1.15.3.4422 per APK
     ``DeviceType.isSupportDynamicsLine``).  Because the main-controller
@@ -65,18 +64,19 @@ async def dynamics_line_loop(handle: DeviceHandle) -> None:
     while not handle._stopping:  # noqa: SLF001
         # The handle's shared rearm event is set after every saga. Using it here
         # would make this saga wake itself and retry at the transfer timeout.
-        await asyncio.sleep(_DYNAMICS_LINE_POLL_INTERVAL)
+        prefer_ble = _ble_connected(handle)
+        await asyncio.sleep(
+            _DYNAMICS_LINE_POLL_INTERVAL
+            if prefer_ble
+            else _DYNAMICS_LINE_CLOUD_POLL_INTERVAL
+        )
 
         if handle._stopping:  # noqa: SLF001
             return
 
-        # BLE-only gate.  If BLE went away without the availability handler
-        # cancelling us (shouldn't happen, but defensive), exit cleanly so
-        # the next _on_ble_connected can start a fresh loop.
-        ble = handle._transports.get(TransportType.BLE)  # noqa: SLF001
-        if ble is None or not ble.is_connected:
-            _logger.debug("dynamics_line_loop [%s]: BLE not connected — loop exiting", handle.device_name)
-            return
+        prefer_ble = _ble_connected(handle)
+        if not prefer_ble and not _cloud_connected(handle):
+            continue
 
         if handle.device_mode() != _DeviceMode.ACTIVE:
             continue
@@ -90,6 +90,24 @@ async def dynamics_line_loop(handle: DeviceHandle) -> None:
             continue
 
         await _enqueue_dynamics_line_saga(handle)
+
+
+def _ble_connected(handle: DeviceHandle) -> bool:
+    """Return whether the mower has a connected Bluetooth transport."""
+    ble = handle._transports.get(TransportType.BLE)  # noqa: SLF001
+    return ble is not None and ble.is_connected
+
+
+def _cloud_connected(handle: DeviceHandle) -> bool:
+    """Return whether either cloud transport is connected."""
+    return any(
+        (transport := handle._transports.get(transport_type)) is not None  # noqa: SLF001
+        and transport.is_connected
+        for transport_type in (
+            TransportType.CLOUD_ALIYUN,
+            TransportType.CLOUD_MAMMOTION,
+        )
+    )
 
 
 def _main_controller_version(handle: DeviceHandle) -> str | None:
