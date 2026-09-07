@@ -435,6 +435,11 @@ class Transport(ABC):
         except InvalidVersion:
             return True
 
+    @classmethod
+    def firmware_uses_send_quota(cls, firmware_version: str) -> bool:
+        """Return whether ordinary cloud sends consume a bounded quota."""
+        return cls._version_is_rate_limited(firmware_version)
+
     def is_send_blocked(self, firmware_version: str) -> bool:
         """Return True when an outbound send must be refused for a device on *firmware_version*.
 

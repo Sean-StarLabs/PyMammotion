@@ -107,22 +107,18 @@ async def mqtt_activity_loop(handle: DeviceHandle) -> None:
             await handle.sleep_or_rearm(interval)
             continue
 
-        # Timer: the later of "last data received" and "last poll sent".
+        # Timer: the later of a report-stream frame and "last poll sent".
+        # Map/trail traffic proves the transport is alive, but it does not prove
+        # the report stream is still delivering device state.
         # Including last_poll_sent_at prevents spam when the device doesn't respond.
-        last_recv = max(
-            (t.last_received_monotonic for t in handle._transports.values()),  # noqa: SLF001
-            default=0.0,
-        )
+        last_recv = handle.last_report_data_at
         last_activity = max(last_recv, last_poll_sent_at)
         wait = interval - (time.monotonic() - last_activity)
 
         if wait > 0:
             if await handle.sleep_or_rearm(wait):
                 continue  # rearmed by user command — re-evaluate immediately
-            last_recv = max(
-                (t.last_received_monotonic for t in handle._transports.values()),  # noqa: SLF001
-                default=0.0,
-            )
+            last_recv = handle.last_report_data_at
             last_activity = max(last_recv, last_poll_sent_at)
             if time.monotonic() - last_activity < interval:
                 continue

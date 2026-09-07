@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Awaitable, Callable
 from unittest.mock import ANY, AsyncMock, MagicMock, PropertyMock, patch
 
@@ -1288,6 +1289,29 @@ async def test_poll_loop_sends_after_silence() -> None:
         await one_shot_mock()
 
     with (
+        patch.object(handle, "sleep_or_rearm", AsyncMock(return_value=False)),
+        patch.object(handle, "_send_one_shot_report", AsyncMock(side_effect=_send_and_stop)),
+    ):
+        await asyncio.wait_for(mqtt_activity_loop(handle), timeout=2.0)
+
+    one_shot_mock.assert_awaited_once()
+
+
+async def test_poll_loop_does_not_treat_trail_traffic_as_report_data() -> None:
+    """Native trail frames must not postpone a stale report-stream poll."""
+    handle = make_handle("dev1", "Luba-Trail")
+    mqtt = _make_connected_transport(TransportType.CLOUD_ALIYUN)
+    mqtt.last_received_monotonic = time.monotonic()
+    await handle.add_transport(mqtt)
+
+    one_shot_mock = AsyncMock()
+
+    async def _send_and_stop() -> None:
+        handle._stopping = True  # noqa: SLF001
+        await one_shot_mock()
+
+    with (
+        patch("pymammotion.device.mqtt_loop.poll_interval", return_value=60.0),
         patch.object(handle, "sleep_or_rearm", AsyncMock(return_value=False)),
         patch.object(handle, "_send_one_shot_report", AsyncMock(side_effect=_send_and_stop)),
     ):
