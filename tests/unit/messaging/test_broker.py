@@ -50,6 +50,38 @@ async def test_unsolicited_goes_to_event_bus() -> None:
     assert len(received) == 1
 
 
+async def test_response_predicate_ignores_late_same_field_response() -> None:
+    """A stale action ACK cannot satisfy a later same-field request."""
+    broker = DeviceMessageBroker()
+    unsolicited: list[object] = []
+
+    async def handler(message: object) -> None:
+        unsolicited.append(message)
+
+    broker.subscribe_unsolicited(handler)
+    stale = make_mock_message("task_ack")
+    stale.action = 1
+    expected = make_mock_message("task_ack")
+    expected.action = 2
+
+    async def send_fn() -> None:
+        await broker.on_message(stale)
+        await broker.on_message(expected)
+
+    with patch(
+        "betterproto2.which_one_of",
+        return_value=("todev_taskctrl_ack", MagicMock()),
+    ):
+        result = await broker.send_and_wait(
+            send_fn,
+            "todev_taskctrl_ack",
+            response_predicate=lambda message: message.action == 2,
+        )
+
+    assert result is expected
+    assert unsolicited == [stale]
+
+
 async def test_timeout_retries_correct_count() -> None:
     broker = DeviceMessageBroker()
     send_count = 0

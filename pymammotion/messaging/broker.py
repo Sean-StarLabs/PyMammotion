@@ -36,6 +36,7 @@ class PendingRequest:
 
     expected_field: str
     future: asyncio.Future[Any]
+    response_predicate: Callable[[Any], bool] | None = None
 
 
 class DeviceMessageBroker:
@@ -64,6 +65,7 @@ class DeviceMessageBroker:
         expected_field: str,
         send_timeout: float = 3.0,
         retries: int = 2,
+        response_predicate: Callable[[Any], bool] | None = None,
     ) -> Any:
         """Send a command and wait for the matching protobuf response.
 
@@ -89,7 +91,11 @@ class DeviceMessageBroker:
             if expected_field in self._pending:
                 msg = f"Already waiting for '{expected_field}'"
                 raise ConcurrentRequestError(msg)
-            self._pending[expected_field] = PendingRequest(expected_field=expected_field, future=future)
+            self._pending[expected_field] = PendingRequest(
+                expected_field=expected_field,
+                future=future,
+                response_predicate=response_predicate,
+            )
 
         try:
             for attempt in range(1, retries + 1):
@@ -161,7 +167,14 @@ class DeviceMessageBroker:
             # losing the response.
             async with self._lock:
                 pending = self._pending.get(field_name)
-                if pending is not None and not pending.future.done():
+                matches_request = (
+                    pending is not None
+                    and (
+                        pending.response_predicate is None
+                        or pending.response_predicate(message)
+                    )
+                )
+                if matches_request and not pending.future.done():
                     pending.future.set_result(message)
                     return  # solicited — do NOT emit to event bus
 
