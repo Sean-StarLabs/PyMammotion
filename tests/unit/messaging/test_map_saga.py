@@ -5,11 +5,13 @@ import asyncio
 import contextlib
 
 import betterproto2
+import pytest
 
-from pymammotion.data.model.hash_list import HashList, NavGetCommData, NavGetHashListData
+from pymammotion.data.model.hash_list import HashList, NavGetCommData, NavGetHashListData, SvgMessage
 from pymammotion.messaging.broker import DeviceMessageBroker
 from pymammotion.messaging.map_saga import MapFetchSaga
-from pymammotion.proto import LubaMsg, MctlNav, NavGetCommDataAck, NavGetHashListAck
+from pymammotion.proto import LubaMsg, MctlNav, NavGetCommDataAck, NavGetHashListAck, SvgMessageAckT
+from pymammotion.transport.base import CommandTimeoutError, SagaFailedError
 from tests.unit.messaging._helpers import make_command_builder as _make_command_builder
 
 
@@ -52,6 +54,23 @@ def _comm_data_msg(
     )
 
 
+def _svg_msg(data_hash: int, parent_hash: int) -> LubaMsg:
+    """Build a single-frame SVG tile linked to a parent area hash."""
+    return LubaMsg(
+        nav=MctlNav(
+            toapp_svg_msg=SvgMessageAckT(
+                pver=1,
+                sub_cmd=0,
+                total_frame=1,
+                current_frame=1,
+                data_hash=data_hash,
+                paternal_hash_a=parent_hash,
+                type=13,
+            )
+        )
+    )
+
+
 def _apply_msg_to_map(msg: LubaMsg, m: HashList) -> None:
     """Minimal StateReducer simulation: update m with each incoming nav message."""
     if not msg.nav:
@@ -62,6 +81,8 @@ def _apply_msg_to_map(msg: LubaMsg, m: HashList) -> None:
             m.update_root_hash_list(NavGetHashListData.from_dict(leaf_val.to_dict(casing=betterproto2.Casing.SNAKE)))
         elif leaf_name == "toapp_get_commondata_ack":
             m.update(NavGetCommData.from_dict(leaf_val.to_dict(casing=betterproto2.Casing.SNAKE)))
+        elif leaf_name == "toapp_svg_msg":
+            m.update(SvgMessage.from_dict(leaf_val.to_dict(casing=betterproto2.Casing.SNAKE)))
     except Exception:  # noqa: BLE001
         pass
 
@@ -132,6 +153,261 @@ async def test_saga_terminates_with_known_type() -> None:
 
     assert saga.result is not None
     assert hash_id in saga.result.area
+    assert saga.result.area_manifest_hashes == {hash_id}
+
+
+async def test_saga_publishes_explicit_empty_area_manifest() -> None:
+    """A completed empty root response authoritatively reports no areas."""
+    broker = DeviceMessageBroker()
+
+    async def send_command(_cmd: bytes) -> None:
+        pass
+
+    mower_map = HashList()
+    saga = MapFetchSaga(
+        device_id="dev-empty",
+        device_name="Luba-Test",
+        is_luba1=True,
+        command_builder=_make_command_builder(),
+        send_command=send_command,
+        get_map=lambda: mower_map,
+    )
+
+    await _run_saga_with_messages(
+        broker,
+        saga,
+        messages=[_hash_list_msg([])],
+        map_update=mower_map,
+    )
+
+    assert saga.result is not None
+    assert saga.result.area_manifest_hashes == set()
+
+
+async def test_saga_does_not_publish_partial_area_manifest() -> None:
+    """A failed transfer clears any previous in-process authority marker."""
+    broker = DeviceMessageBroker()
+
+    async def send_command(_cmd: bytes) -> None:
+        pass
+
+    mower_map = HashList(area_manifest_hashes={123})
+    saga = MapFetchSaga(
+        device_id="dev-partial",
+        device_name="Luba-Test",
+        is_luba1=True,
+        command_builder=_make_command_builder(),
+        send_command=send_command,
+        get_map=lambda: mower_map,
+    )
+    saga.step_timeout = 0.01
+
+    with pytest.raises(CommandTimeoutError):
+        await saga._run(broker)  # noqa: SLF001
+
+    assert mower_map.area_manifest_hashes is None
+
+
+async def test_saga_does_not_finish_after_out_of_order_incomplete_area() -> None:
+    """A final-numbered frame cannot hide a missing earlier area frame."""
+    broker = DeviceMessageBroker()
+
+    async def send_command(_cmd: bytes) -> None:
+        pass
+
+    incomplete_hash = 111
+    complete_hash = 222
+    mower_map = HashList(area_manifest_hashes={999})
+    saga = MapFetchSaga(
+        device_id="dev-out-of-order",
+        device_name="Luba-Test",
+        is_luba1=True,
+        command_builder=_make_command_builder(),
+        send_command=send_command,
+        get_map=lambda: mower_map,
+    )
+    saga.step_timeout = 0.05
+
+    with pytest.raises(SagaFailedError):
+        await _run_saga_with_messages(
+            broker,
+            saga,
+            messages=[
+                _hash_list_msg([incomplete_hash, complete_hash]),
+                _comm_data_msg(
+                    incomplete_hash,
+                    type_code=0,
+                    current_frame=2,
+                    total_frame=2,
+                ),
+                _comm_data_msg(complete_hash, type_code=0),
+            ],
+            delay=0.005,
+            map_update=mower_map,
+        )
+
+    assert mower_map.area_manifest_hashes is None
+
+
+async def test_saga_does_not_finish_after_partial_unknown_type() -> None:
+    """Unknown multi-frame data must be complete before a hash is addressed."""
+    broker = DeviceMessageBroker()
+
+    async def send_command(_cmd: bytes) -> None:
+        pass
+
+    unknown_hash = 333
+    mower_map = HashList(area_manifest_hashes={999})
+    saga = MapFetchSaga(
+        device_id="dev-partial-unknown",
+        device_name="Luba-Test",
+        is_luba1=True,
+        command_builder=_make_command_builder(),
+        send_command=send_command,
+        get_map=lambda: mower_map,
+    )
+    saga.step_timeout = 0.05
+
+    with pytest.raises(SagaFailedError):
+        await _run_saga_with_messages(
+            broker,
+            saga,
+            messages=[
+                _hash_list_msg([unknown_hash]),
+                _comm_data_msg(
+                    unknown_hash,
+                    type_code=99,
+                    current_frame=1,
+                    total_frame=2,
+                ),
+            ],
+            delay=0.005,
+            map_update=mower_map,
+        )
+
+    assert mower_map.area_manifest_hashes is None
+
+
+async def test_saga_does_not_address_discarded_common_data_svg() -> None:
+    """A common-data SVG placeholder cannot complete the real SVG transfer."""
+    broker = DeviceMessageBroker()
+
+    async def send_command(_cmd: bytes) -> None:
+        pass
+
+    svg_hash = 444
+    mower_map = HashList(area_manifest_hashes={999})
+    saga = MapFetchSaga(
+        device_id="dev-common-data-svg",
+        device_name="Luba-Test",
+        is_luba1=True,
+        command_builder=_make_command_builder(),
+        send_command=send_command,
+        get_map=lambda: mower_map,
+    )
+    saga.step_timeout = 0.05
+
+    with pytest.raises(SagaFailedError):
+        await _run_saga_with_messages(
+            broker,
+            saga,
+            messages=[
+                _hash_list_msg([svg_hash]),
+                _comm_data_msg(
+                    svg_hash,
+                    type_code=13,
+                    current_frame=1,
+                    total_frame=2,
+                ),
+            ],
+            delay=0.005,
+            map_update=mower_map,
+        )
+
+    assert mower_map.area_manifest_hashes is None
+
+
+async def test_complete_svg_does_not_hide_partial_parent_area() -> None:
+    """A complete child tile cannot make an incomplete boundary authoritative."""
+    broker = DeviceMessageBroker()
+
+    async def send_command(_cmd: bytes) -> None:
+        pass
+
+    area_hash = 555
+    mower_map = HashList(area_manifest_hashes={999})
+    saga = MapFetchSaga(
+        device_id="dev-partial-area-svg",
+        device_name="Luba-Test",
+        is_luba1=True,
+        command_builder=_make_command_builder(),
+        send_command=send_command,
+        get_map=lambda: mower_map,
+    )
+    saga.step_timeout = 0.05
+
+    with pytest.raises(SagaFailedError):
+        await _run_saga_with_messages(
+            broker,
+            saga,
+            messages=[
+                _hash_list_msg([area_hash]),
+                _comm_data_msg(
+                    area_hash,
+                    type_code=0,
+                    current_frame=2,
+                    total_frame=2,
+                ),
+                _svg_msg(data_hash=556, parent_hash=area_hash),
+            ],
+            delay=0.005,
+            map_update=mower_map,
+        )
+
+    assert mower_map.area_manifest_hashes is None
+
+
+async def test_saga_manifest_uses_only_current_transfer_frames() -> None:
+    """Superseded root-list records cannot leak into the committed manifest."""
+    broker = DeviceMessageBroker()
+
+    async def send_command(_cmd: bytes) -> None:
+        pass
+
+    stale_hash = 111
+    current_hash = 222
+    mower_map = HashList()
+    mower_map.update_root_hash_list(
+        NavGetHashListData(
+            sub_cmd=0,
+            total_frame=2,
+            current_frame=1,
+            data_couple=[stale_hash],
+        )
+    )
+    saga = MapFetchSaga(
+        device_id="dev-replaced",
+        device_name="Luba-Test",
+        is_luba1=True,
+        command_builder=_make_command_builder(),
+        send_command=send_command,
+        get_map=lambda: mower_map,
+    )
+
+    await _run_saga_with_messages(
+        broker,
+        saga,
+        messages=[
+            _hash_list_msg([current_hash]),
+            _comm_data_msg(stale_hash, type_code=0),
+            _comm_data_msg(current_hash, type_code=0),
+        ],
+        map_update=mower_map,
+    )
+
+    assert saga.result is not None
+    assert set(saga.result.area) == {stale_hash, current_hash}
+    assert saga.result.area_manifest_hashes == {current_hash}
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +460,7 @@ async def test_saga_does_not_loop_on_unknown_type() -> None:
     assert hash_id not in saga.result.area
     assert hash_id not in saga.result.obstacle
     assert hash_id not in saga.result.path
+    assert saga.result.area_manifest_hashes == set()
 
     # The device should have been asked exactly once for hash data (not re-requested)
     synchronize_calls = saga._command_builder.synchronize_hash_data.call_count  # noqa: SLF001
