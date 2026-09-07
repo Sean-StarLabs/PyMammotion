@@ -487,6 +487,40 @@ class MammotionClient:
         if time.monotonic() - handle.last_report_at > max_age_s:
             await handle.request_report_snapshot()
 
+    async def ensure_fresh_report_data(
+        self,
+        device_name: str,
+        *,
+        max_age_s: float = 5.0,
+        timeout: float = 10.0,
+    ) -> bool:
+        """Wait until the device state contains recent report telemetry."""
+        handle = self._device_registry.get_by_name(device_name)
+        if handle is None:
+            return False
+        return await handle.ensure_fresh_report_data(
+            max_age_s=max_age_s,
+            timeout=timeout,
+        )
+
+    def report_data_token(self, device_name: str) -> int:
+        """Return the change token for the latest device telemetry report."""
+        handle = self._device_registry.get_by_name(device_name)
+        return handle.report_data_token if handle is not None else 0
+
+    async def wait_for_report_data(
+        self,
+        device_name: str,
+        *,
+        since: int,
+        timeout: float,
+    ) -> bool:
+        """Wait for device telemetry newer than *since*."""
+        handle = self._device_registry.get_by_name(device_name)
+        if handle is None:
+            return False
+        return await handle.wait_for_report_data(timeout, since=since)
+
     def subscribe_device_status(
         self,
         device_name: str,

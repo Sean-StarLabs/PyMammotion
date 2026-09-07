@@ -229,7 +229,8 @@ class DeviceCommandQueue:
                 break
 
             try:
-                # Release dedup slot as soon as item is dequeued
+                # Deduplication suppresses queued duplicates only. A new trigger
+                # that arrives while work is executing represents independent work.
                 if item.dedup_key is not None:
                     self._pending_dedup_keys.discard(item.dedup_key)
 
