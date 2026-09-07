@@ -10,10 +10,12 @@ raise SagaFailedError.
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import AsyncMock
 
 import betterproto2
 import pytest
 
+from pymammotion.data.model import GenerateRouteInformation
 from pymammotion.data.model.hash_list import HashList
 from pymammotion.messaging.broker import DeviceMessageBroker
 from pymammotion.messaging.mow_path_saga import MowPathSaga
@@ -82,3 +84,29 @@ async def test_skip_planning_with_no_route_val_raises_saga_failed() -> None:
 
 # Sanity import to keep linter quiet about unused imports
 _ = betterproto2
+
+
+async def test_line_hash_transfer_extracts_the_filtered_leaf_name() -> None:
+    """A sub-command filter must not become part of the protobuf leaf name."""
+    broker = DeviceMessageBroker()
+    saga = MowPathSaga(
+        command_builder=_make_command_builder(),
+        send_command=AsyncMock(),
+        get_map=HashList,
+        zone_hashs=[],
+        route_info=GenerateRouteInformation(),
+        skip_planning=True,
+        device_name="Luba-Test",
+    )
+
+    async def inject() -> None:
+        await asyncio.sleep(0)
+        await broker.on_message(_hash_list_msg_sub3([0]))
+
+    injector = asyncio.create_task(inject())
+    try:
+        await saga._run(broker)  # noqa: SLF001
+    finally:
+        await injector
+
+    assert [frame.data_couple for frame in saga.result_root_hash_list.data] == [[0]]

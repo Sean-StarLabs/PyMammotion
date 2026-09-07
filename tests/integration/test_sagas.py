@@ -12,10 +12,12 @@ from pymammotion.data.model.hash_list import (
     AreaHashNameList,
     HashList,
     MowPath,
+    MowPathPacket,
     NavGetHashListData,
     Plan,
     RootHashList,
 )
+from pymammotion.data.model import GenerateRouteInformation
 from pymammotion.messaging.broker import CommandTimeoutError, DeviceMessageBroker
 from pymammotion.messaging.map_saga import MapFetchSaga
 from pymammotion.messaging.mow_path_saga import MowPathSaga
@@ -697,9 +699,7 @@ async def test_map_saga_resumes_partial_area_via_synchronize_hash_data() -> None
         if cmd == b"hash_list_cmd" and active_callbacks:
             # Deliver the single-frame root hash list (same hashes as seeded).
             await active_callbacks[-1](
-                _make_hash_list_ack_response(
-                    total_frame=1, current_frame=1, sub_cmd=0, data_couple=[111, 222, 333]
-                )
+                _make_hash_list_ack_response(total_frame=1, current_frame=1, sub_cmd=0, data_couple=[111, 222, 333])
             )
         # After saga sends synchronize_hash_data for the partial hash,
         # simulate the device delivering the missing frame.
@@ -782,6 +782,130 @@ async def test_invalidate_maps_clears_only_root_hash_list_on_mismatch() -> None:
 # ---------------------------------------------------------------------------
 # MowPathSaga
 # ---------------------------------------------------------------------------
+
+
+def test_mow_path_saga_assembles_frames_before_commit() -> None:
+    """A batch becomes complete only after every expected frame is local."""
+    transactions: dict[int, dict[int, MowPath]] = {}
+    first = MowPath(transaction_id=20, current_frame=1, total_frame=2)
+    second = MowPath(transaction_id=20, current_frame=2, total_frame=2)
+
+    assert MowPathSaga._store_batch_frame(transactions, first, 20) is False  # noqa: SLF001
+    assert MowPathSaga._store_batch_frame(transactions, second, 20) is True  # noqa: SLF001
+    assert set(transactions[20]) == {1, 2}
+
+
+def test_mow_path_saga_ignores_residual_transaction_frame() -> None:
+    """A late frame from an earlier request cannot enter the active batch."""
+    transactions: dict[int, dict[int, MowPath]] = {}
+    stale = MowPath(transaction_id=10, current_frame=1, total_frame=1)
+
+    assert MowPathSaga._store_batch_frame(transactions, stale, 20) is False  # noqa: SLF001
+    assert transactions == {}
+
+
+@pytest.mark.parametrize("current_frame", [0, 3])
+def test_mow_path_saga_rejects_out_of_range_frame(current_frame: int) -> None:
+    """Invalid frame indices cannot count toward transaction progress."""
+    transactions: dict[int, dict[int, MowPath]] = {}
+    frame = MowPath(transaction_id=20, current_frame=current_frame, total_frame=2)
+
+    with pytest.raises(SagaFailedError):
+        MowPathSaga._store_batch_frame(transactions, frame, 20)  # noqa: SLF001
+
+    assert transactions == {}
+
+
+def test_mow_path_saga_rejects_packets_outside_requested_manifest() -> None:
+    """A stale cover-path packet cannot be labelled as the new route."""
+    transactions: dict[int, dict[int, MowPath]] = {}
+    frame = MowPath(
+        transaction_id=20,
+        current_frame=1,
+        total_frame=1,
+        path_packets=[MowPathPacket(path_hash=999)],
+    )
+
+    with pytest.raises(SagaFailedError):
+        MowPathSaga._store_batch_frame(  # noqa: SLF001
+            transactions,
+            frame,
+            20,
+            {100},
+        )
+
+    assert transactions == {}
+
+
+def test_mow_path_saga_rejects_incomplete_requested_manifest() -> None:
+    """A complete frame set must contain every hash requested in its batch."""
+    transactions: dict[int, dict[int, MowPath]] = {}
+    frame = MowPath(
+        transaction_id=20,
+        current_frame=1,
+        total_frame=1,
+        path_packets=[MowPathPacket(path_hash=100)],
+    )
+
+    with pytest.raises(SagaFailedError):
+        MowPathSaga._store_batch_frame(  # noqa: SLF001
+            transactions,
+            frame,
+            20,
+            {100, 200},
+        )
+
+    assert transactions == {}
+
+
+def test_mow_path_retry_keeps_completed_batches_only() -> None:
+    """A retry skips completed hashes while discarding its partial transaction."""
+    saga = MowPathSaga(_make_command_builder(), AsyncMock(), HashList, [], skip_planning=False)
+    saga._completed_hashes.add(100)  # noqa: SLF001
+    saga._pending_transactions = {  # noqa: SLF001
+        20: {1: MowPath(transaction_id=20, current_frame=1, total_frame=1)},
+    }
+
+    assert saga._hashes_to_fetch([100, 200]) == [200]  # noqa: SLF001
+    assert saga._pending_transactions[20][1].current_frame == 1  # noqa: SLF001
+
+
+async def test_fetch_only_mow_path_stops_without_active_task() -> None:
+    """A queued route read becomes a no-op if its task ended before dispatch."""
+    send = AsyncMock()
+    saga = MowPathSaga(
+        _make_command_builder(),
+        send,
+        HashList,
+        [],
+        route_info=GenerateRouteInformation(),
+        skip_planning=True,
+        get_active_path_hash=lambda: 0,
+    )
+
+    await saga._run(AsyncMock())  # noqa: SLF001
+
+    send.assert_not_awaited()
+
+
+def test_fetch_only_retry_keeps_initial_path_identity() -> None:
+    """A retry cannot rebind collected route data to a later task."""
+    active_path_hash = 100
+    saga = MowPathSaga(
+        _make_command_builder(),
+        AsyncMock(),
+        HashList,
+        [],
+        route_info=GenerateRouteInformation(),
+        skip_planning=True,
+        get_active_path_hash=lambda: active_path_hash,
+    )
+
+    assert saga._capture_task_identity()  # noqa: SLF001
+    active_path_hash = 200
+    assert saga._capture_task_identity()  # noqa: SLF001
+
+    assert saga.started_path_hash == 100
 
 
 async def test_mow_path_saga_preserves_current_mow_path_across_runs() -> None:
@@ -885,6 +1009,7 @@ async def test_mow_path_saga_syncs_before_route_and_line_info() -> None:
             send_command=send_command,
             get_map=lambda: hash_list,
             zone_hashs=[100],
+            route_info=GenerateRouteInformation(one_hashs=[100]),
             sync_type=2,  # BLE
         )
         saga.step_timeout = 0.01
@@ -906,6 +1031,9 @@ async def test_mow_path_saga_syncs_before_route_and_line_info() -> None:
 
     route_idx = names.index("generate_route_information")
     assert names[route_idx - 1] == "send_todev_ble_sync", f"no sync before route: {names[: route_idx + 1]}"
+
+    manifest_idx = names.index("get_all_boundary_hash_list")
+    assert route_idx < manifest_idx, f"route manifest requested before route generation: {names}"
 
     line_idx = names.index("get_line_info_list")
     assert names[line_idx - 1] == "send_todev_ble_sync", f"no sync before cover-path: {names[: line_idx + 1]}"
@@ -984,9 +1112,7 @@ async def test_spino_plan_saga_empty_device_short_circuits() -> None:
     subscribe_side_effect, active_callbacks = _make_subscribe_ctx()
     broker.subscribe_unsolicited.side_effect = subscribe_side_effect
 
-    empty_response = MagicMock(
-        ctrl=MagicMock(plan_job_set=MagicMock(totalplannum=0, jobid=0))
-    )
+    empty_response = MagicMock(ctrl=MagicMock(plan_job_set=MagicMock(totalplannum=0, jobid=0)))
 
     async def send_command(_cmd: bytes) -> None:
         if active_callbacks:

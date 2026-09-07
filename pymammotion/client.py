@@ -2352,6 +2352,16 @@ class MammotionClient:
                     device_name,
                 )
                 return
+
+            def _active_path_hash() -> int:
+                current = handle.snapshot.raw
+                if (
+                    not isinstance(current, MowerDevice)
+                    or current.report_data.dev.sys_status not in MOWING_ACTIVE_MODES
+                ):
+                    return 0
+                return int(current.report_data.work.path_hash)
+
             saga = MowPathSaga(
                 command_builder=handle.commands,
                 send_command=handle.send_raw,
@@ -2361,12 +2371,24 @@ class MammotionClient:
                 skip_planning=skip_planning,
                 device_name=device_name,
                 sync_type=2 if handle.is_transport_connected(TransportType.BLE) else 3,
+                next_transaction_id=handle.next_route_transaction_id,
+                get_active_path_hash=_active_path_hash,
             )
 
             async def _on_mow_path_complete() -> None:
-                device = self.get_device_by_name(device_name)
-                if device is not None and device.location.RTK.latitude != 0.0:
-                    device.map.generate_mowing_geojson(device.location.RTK)
+                ownership = (
+                    {
+                        "expected_path_hash": saga.started_path_hash,
+                    }
+                    if skip_planning
+                    else {}
+                )
+                await handle.commit_mow_path_transactions(
+                    saga.result,
+                    **ownership,
+                    replace=not skip_planning,
+                    line_hash_list=saga.result_root_hash_list,
+                )
 
             await handle.enqueue_saga(saga, on_complete=_on_mow_path_complete)
 
