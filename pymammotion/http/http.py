@@ -1165,6 +1165,13 @@ class MammotionHTTP:
         app's.  Worth remembering before attributing an auth failure to the
         signature — it is rarely the cause.
         """
+        if not MAMMOTION_OAUTH2_CLIENT_ID or not MAMMOTION_OAUTH2_CLIENT_SECRET:
+            _LOGGER.warning(
+                "Mammotion OAuth client credentials are not configured; "
+                "using the legacy password grant"
+            )
+            return await self.login(account, password)
+
         self.account = account
         self._password = password
 

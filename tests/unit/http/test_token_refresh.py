@@ -26,8 +26,20 @@ from aiohttp import ClientError, ContentTypeError
 import jwt as pyjwt
 import pytest
 
+from pymammotion.http import http as http_module
 from pymammotion.http.http import MammotionHTTP
 from pymammotion.transport.base import ReLoginRequiredError
+
+
+@pytest.fixture(autouse=True)
+def _oauth_client_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep OAuth-path tests independent from a developer's environment."""
+    monkeypatch.setattr(http_module, "MAMMOTION_OAUTH2_CLIENT_ID", "test-client")
+    monkeypatch.setattr(
+        http_module,
+        "MAMMOTION_OAUTH2_CLIENT_SECRET",
+        "test-secret",
+    )
 
 
 def _jwt(expires_in: float = 3600.0) -> str:
@@ -247,6 +259,22 @@ async def test_login_v2_raises_connection_error_on_server_failure(status: int) -
 
     with pytest.raises(ConnectionError):
         await http.login_v2("a@b.c", "pw")
+
+
+async def test_login_v2_uses_legacy_grant_without_oauth_client_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A credential-free installation can still explicitly establish a session."""
+    http = _make_http(status=200)
+    legacy_response = MagicMock(code=0)
+    http.login = AsyncMock(return_value=legacy_response)  # type: ignore[method-assign]
+    monkeypatch.setattr(http_module, "MAMMOTION_OAUTH2_CLIENT_ID", "")
+    monkeypatch.setattr(http_module, "MAMMOTION_OAUTH2_CLIENT_SECRET", "")
+
+    result = await http.login_v2("a@b.c", "pw")
+
+    assert result is legacy_response
+    http.login.assert_awaited_once_with("a@b.c", "pw")
 
 
 # ---------------------------------------------------------------------------
