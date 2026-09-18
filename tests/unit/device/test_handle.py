@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
 
@@ -812,6 +812,45 @@ async def test_active_transport_raises_when_only_mqtt_and_offline() -> None:
 
     with pytest.raises(NoTransportAvailableError):
         handle.active_transport()
+
+
+async def test_reprobe_cloud_transport_rearms_offline_cloud_path() -> None:
+    """An offline gate can be cleared by a deliberate cloud report probe."""
+    mqtt = make_transport(TransportType.CLOUD_MAMMOTION, connected=True)
+    mqtt.availability = TransportAvailability.CONNECTED
+    mqtt.connect = AsyncMock()
+    handle = make_handle()
+    await handle.add_transport(mqtt)
+    handle.update_availability(
+        TransportType.CLOUD_MAMMOTION,
+        TransportAvailability.CONNECTED,
+        mqtt_reported_offline=True,
+    )
+
+    report = AsyncMock()
+    handle._send_one_shot_report = report  # type: ignore[method-assign]
+
+    assert await handle.reprobe_cloud_transport() is True
+    assert handle.availability.mqtt_reported_offline is False
+    report.assert_awaited_once()
+    mqtt.connect.assert_not_awaited()
+
+
+async def test_reprobe_cloud_transport_restarts_dead_cloud_task() -> None:
+    """A dead cloud transport is restarted before the report probe is queued."""
+    mqtt = make_transport(TransportType.CLOUD_MAMMOTION, connected=False)
+    mqtt.availability = TransportAvailability.CONNECTED
+    mqtt.connect = AsyncMock()
+    type(mqtt).is_connected = PropertyMock(side_effect=[False, True])
+    handle = make_handle()
+    await handle.add_transport(mqtt)
+
+    report = AsyncMock()
+    handle._send_one_shot_report = report  # type: ignore[method-assign]
+
+    assert await handle.reprobe_cloud_transport() is True
+    mqtt.connect.assert_awaited_once()
+    report.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

@@ -1689,6 +1689,36 @@ class DeviceHandle:
             dedup_key="one_shot_report",
         )
 
+    async def reprobe_cloud_transport(self) -> bool:
+        """Re-arm a connected cloud path and request a fresh device report.
+
+        A mower can report itself offline while its MQTT session remains alive.
+        Treating that flag as permanent prevents the poll loop from ever sending
+        the request that would wake or refresh the session.  Re-probing is kept
+        separate from normal command selection so callers can explicitly limit it
+        to a low-rate recovery path.
+
+        Returns ``True`` when a cloud transport was connected and a report request
+        was queued, otherwise ``False``.
+        """
+        if self._stopping:
+            return False
+        cloud = self._pick_cloud_transport()
+        if cloud is None:
+            return False
+        if not cloud.is_connected:
+            await cloud.connect()
+        if not cloud.is_connected:
+            return False
+
+        self.update_availability(
+            cloud.transport_type,
+            cloud.availability,
+            mqtt_reported_offline=False,
+        )
+        await self._send_one_shot_report()
+        return True
+
     async def _enqueue_report_refresh(self) -> None:
         """Queue the shared stale-report refresh using dispatch-time transport state."""
         if self._report_refresh_in_flight:
