@@ -9,7 +9,7 @@ from enum import Enum
 import logging
 import socket
 import time
-from typing import TYPE_CHECKING, Generic, Self, TypeVar
+from typing import TYPE_CHECKING, Generic, Protocol, Self, TypeVar
 
 from packaging.version import InvalidVersion, Version
 
@@ -49,6 +49,17 @@ MQTT_RECONNECT_MAX_SEC_MAMMOTION = 120
 
 class TransportError(Exception):
     """Base exception for all transport failures."""
+
+
+class CredentialAttemptLimitError(RuntimeError):
+    """Raised when a credential exchange has no authorized wire claim."""
+
+
+class CredentialAttemptGate(Protocol):
+    """Host-owned gate that authorizes credential-bearing HTTP exchanges."""
+
+    async def claim(self, allow_after_success: bool = False) -> None:
+        """Authorize one wire claim, or an accepted-session token refresh."""
 
 
 class TransportRateLimitedError(TransportError):
@@ -100,10 +111,11 @@ class AccountInUseError(ReLoginRequiredError):
 class LoginFailedError(AuthError):
     """Full re-login with stored credentials failed; user must reconfigure."""
 
-    def __init__(self, account_id: str, reason: str) -> None:
+    def __init__(self, account_id: str, reason: str, code: int | None = None) -> None:
         """Store account ID and reason, then format the message."""
         self.account_id = account_id
         self.reason = reason
+        self.code = code
         super().__init__(f"Login failed for account '{account_id}': {reason}")
 
 

@@ -44,10 +44,11 @@ from pymammotion.http.model.http import (
 )
 from pymammotion.http.model.response_factory import response_factory
 from pymammotion.http.model.rtk import RTK
-from pymammotion.transport.base import AuthError, ReLoginRequiredError
+from pymammotion.transport.base import AuthError, CredentialAttemptGate, ReLoginRequiredError
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
+
 
 T = TypeVar("T")
 _ModelT = TypeVar("_ModelT", bound=DataClassORJSONMixin)
@@ -186,6 +187,7 @@ class MammotionHTTP:
         password: str | None = None,
         session: ClientSession | None = None,
         ha_version: str | None = None,
+        on_credential_attempt: CredentialAttemptGate | None = None,
     ) -> None:
         self.device_info: list[DeviceInfo] = []
         self.mqtt_credentials: MQTTConnection | None = None
@@ -194,6 +196,7 @@ class MammotionHTTP:
         self.code = 0
         self.msg = None
         self._session: ClientSession | None = session  # None → new session per request
+        self._on_credential_attempt = on_credential_attempt
         self.account = account
         # Stored for callers' convenience only.  NOTHING in this class may read it:
         # a session is minted from a password exclusively by an explicit, caller-
@@ -244,6 +247,10 @@ class MammotionHTTP:
             async with ClientSession(timeout=self._DEFAULT_HTTP_TIMEOUT) as session:
                 yield session
 
+    async def _claim_credential_attempt(self, allow_after_success: bool = False) -> None:
+        if self._on_credential_attempt is not None:
+            await self._on_credential_attempt.claim(allow_after_success)
+
     @classmethod
     def from_cache(
         cls,
@@ -252,6 +259,7 @@ class MammotionHTTP:
         password: str | None = None,
         session: ClientSession | None = None,
         ha_version: str | None = None,
+        on_credential_attempt: CredentialAttemptGate | None = None,
     ) -> MammotionHTTP | None:
         """Rebuild a login session from a previously serialized credential cache.
 
@@ -295,7 +303,13 @@ class MammotionHTTP:
             # ``response.data.access_token`` directly and would trip over a dict.
             response.data = login_info
 
-            http = cls(account, password, session=session, ha_version=ha_version)
+            http = cls(
+                account,
+                password,
+                session=session,
+                ha_version=ha_version,
+                on_credential_attempt=on_credential_attempt,
+            )
             http.response = response  # derives jwt_info + expires_in from the JWT exp claim
             http.login_info = login_info
         except _CACHE_DECODE_ERRORS:
@@ -1007,6 +1021,7 @@ class MammotionHTTP:
         """Log in to the service using the provided account and password."""
         self.account = account
         self._password = password
+        await self._claim_credential_attempt()
         async with self._client_session() as session:
             resp = await session.post(
                 f"{MAMMOTION_DOMAIN}/oauth/token",
@@ -1083,6 +1098,7 @@ class MammotionHTTP:
             timestamp=timestamp,
         )
 
+        await self._claim_credential_attempt(allow_after_success=True)
         async with self._client_session() as session:
             resp = await session.post(
                 f"{MAMMOTION_DOMAIN}/oauth2/token",
@@ -1186,6 +1202,7 @@ class MammotionHTTP:
             timestamp=timestamp,
         )
 
+        await self._claim_credential_attempt()
         async with self._client_session() as session:
             resp = await session.post(
                 f"{MAMMOTION_DOMAIN}/oauth2/token",
@@ -1211,7 +1228,12 @@ class MammotionHTTP:
                 return Response.from_dict({"code": resp.status, "msg": "Login failed"})
             data = await resp.json()
         if data.get("code") != 0:
-            return Response.from_dict({"code": resp.status, "msg": data.get("msg") or "Login failed"})
+            return Response.from_dict(
+                {
+                    "code": data.get("code", resp.status),
+                    "msg": data.get("msg") or "Login failed",
+                }
+            )
         login_response = response_factory(Response[LoginResponseData], data)
         if login_response is None or login_response.data is None:
             return Response.from_dict({"code": resp.status, "msg": "Login failed"})

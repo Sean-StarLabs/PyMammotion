@@ -126,6 +126,7 @@ if TYPE_CHECKING:
     from pymammotion.data.mqtt.properties import MammotionPropertiesMessage, ThingPropertiesMessage
     from pymammotion.data.mqtt.status import ThingStatusMessage
     from pymammotion.state.device_state import DeviceSnapshot
+    from pymammotion.transport.base import CredentialAttemptGate
 
 _logger = logging.getLogger(__name__)
 
@@ -170,6 +171,7 @@ class MammotionClient:
         # RAII subscriptions for state-change watchers (keyed by device_name)
         self._watcher_subscriptions: dict[str, list[Subscription]] = {}
         self._ha_version: str | None = ha_version
+        self.on_credential_attempt: CredentialAttemptGate | None = None
         #: Fired when all automatic auth recovery attempts (relogin, token refresh,
         #: reconnect) have been exhausted and human intervention is required.
         #: Called with ``(account_id, transport_type, exc)`` so the host can mark
@@ -1137,10 +1139,14 @@ class MammotionClient:
         # supersedes it server-side regardless, and revoking first would kill the
         # credentials the host still has cached before their replacement exists.
         await self._sign_out_existing_session(account, revoke=False)
-        mammotion_http = MammotionHTTP(session=session, ha_version=self._ha_version)
+        mammotion_http = MammotionHTTP(
+            session=session,
+            ha_version=self._ha_version,
+            on_credential_attempt=self.on_credential_attempt,
+        )
         login_resp = await mammotion_http.login_v2(account, password)
         if login_resp.code != 0:
-            raise LoginFailedError(account, login_resp.msg)
+            raise LoginFailedError(account, login_resp.msg, code=login_resp.code)
 
         device_list_owned_resp = await mammotion_http.get_user_device_list()
         device_list_resp = await mammotion_http.get_user_shared_device_page()
@@ -1297,7 +1303,12 @@ class MammotionClient:
             acct_session.password = password
 
         mammotion_http = MammotionHTTP.from_cache(
-            cached_data, account, password, session=session, ha_version=self._ha_version
+            cached_data,
+            account,
+            password,
+            session=session,
+            ha_version=self._ha_version,
+            on_credential_attempt=self.on_credential_attempt,
         )
         # Two distinct outcomes, and which one happened decides what the user should do:
         # a cache carrying no login at all is a first run or a wiped/rolled-back store,
