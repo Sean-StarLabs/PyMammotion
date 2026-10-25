@@ -173,8 +173,7 @@ class MowPathSaga(Saga):
         ):
             raise SagaFailedError(MowPathSaga.name, MowPathSaga.max_attempts)
         if expected_hashes is not None and any(
-            int(packet.path_hash) not in expected_hashes
-            for packet in frame.path_packets
+            int(packet.path_hash) not in expected_hashes for packet in frame.path_packets
         ):
             raise SagaFailedError(MowPathSaga.name, MowPathSaga.max_attempts)
 
@@ -185,9 +184,7 @@ class MowPathSaga(Saga):
         complete = HashList.mow_path_transaction_complete(frames)
         if complete and expected_hashes is not None:
             observed_hashes = {
-                int(packet.path_hash)
-                for stored_frame in frames.values()
-                for packet in stored_frame.path_packets
+                int(packet.path_hash) for stored_frame in frames.values() for packet in stored_frame.path_packets
             }
             if observed_hashes != expected_hashes:
                 transactions.pop(transaction_id, None)

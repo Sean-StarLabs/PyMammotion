@@ -1455,8 +1455,6 @@ class DeviceHandle:
         before = self._report_data_generation
         if self._last_report_data_at and time.monotonic() - self._last_report_data_at <= max_age_s:
             return True
-        if self._skips_activity_loops:
-            return False
         # This path has already applied the caller's freshness threshold.  The
         # ordinary 15-second snapshot debounce would otherwise suppress a poll
         # for telemetry that is stale by the caller's stricter definition.

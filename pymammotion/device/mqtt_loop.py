@@ -28,13 +28,6 @@ _logger = logging.getLogger(__name__)
 #: Activity-loop backoff when MQTT is rate-limited and no BLE is available.
 _RATE_LIMITED_BACKOFF: float = 43200.0  # 12 hours
 
-# A direct Mammotion MQTT session can remain connected while the mower reports
-# itself offline after sitting docked.  Re-arm that path occasionally so the
-# integration does not wait forever for the inbound frame that would clear the
-# offline gate.  This does not change the normal poll cadence or apply to the
-# quota-limited Aliyun transport.
-_MAMMOTION_OFFLINE_REPROBE_INTERVAL: float = 5 * 60
-
 #: MQTT one-shot (count=1) poll cadence per device mode.  Tuned for cloud quotas.
 #: Each entry can be overridden at process startup via an environment variable:
 #: MAMMOTION_POLL_ACTIVE_SECS, MAMMOTION_POLL_DOCKED_CHARGING_SECS,
@@ -89,10 +82,6 @@ async def mqtt_activity_loop(handle: DeviceHandle) -> None:
     to wake an in-progress sleep early for immediate re-evaluation.
     """
     last_poll_sent_at: float = 0.0
-    initial_reprobe_interval = poll_interval(handle)
-    if handle.cloud_transport() is TransportType.CLOUD_MAMMOTION:
-        initial_reprobe_interval = _MAMMOTION_OFFLINE_REPROBE_INTERVAL
-    offline_reprobe_at = time.monotonic() + initial_reprobe_interval
 
     while not handle._stopping:  # noqa: SLF001
         interval = poll_interval(handle)
@@ -109,34 +98,13 @@ async def mqtt_activity_loop(handle: DeviceHandle) -> None:
         # ``mqtt_reported_offline`` clears on the next inbound MQTT frame,
         # so both natural recovery signals already wake us.
         if not handle.has_usable_transport:
-            now = time.monotonic()
-            cloud_type = handle.cloud_transport()
-            reprobe_interval = (
-                _MAMMOTION_OFFLINE_REPROBE_INTERVAL
-                if cloud_type is TransportType.CLOUD_MAMMOTION
-                else interval
-            )
-            if now >= offline_reprobe_at:
-                try:
-                    if await handle.reprobe_cloud_transport():
-                        _logger.info(
-                            "poll_loop [%s]: re-probed Mammotion cloud transport after offline report",
-                            handle.device_name,
-                        )
-                except Exception:  # noqa: BLE001 — recovery must not kill the activity loop
-                    _logger.warning(
-                        "poll_loop [%s]: cloud re-probe failed; retrying later",
-                        handle.device_name,
-                        exc_info=True,
-                    )
-                offline_reprobe_at = now + reprobe_interval
             _logger.debug(
                 "poll_loop [%s]: no usable transport (mqtt_offline=%s) — backing off %.0fs",
                 handle.device_name,
                 handle._availability.mqtt_reported_offline,  # noqa: SLF001
                 interval,
             )
-            await handle.sleep_or_rearm(max(1.0, min(interval, offline_reprobe_at - now)))
+            await handle.sleep_or_rearm(interval)
             continue
 
         # Timer: the later of "last data received" and "last poll sent".
